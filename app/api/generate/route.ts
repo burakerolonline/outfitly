@@ -1,192 +1,56 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// ═══════════════════════════════════════════════════════
-// Tek model: gpt-4o (ChatGPT'nin kullandığı aynı model)
-// Tek API: OpenAI Responses API (image_generation tool)
-// Başka hiçbir model/servis yok.
-// ═══════════════════════════════════════════════════════
-
 const OPENAI_URL = "https://api.openai.com/v1";
 
 export const maxDuration = 120;
 
-// ─── GPT-4o ile fotoğraf düzenle (ChatGPT ile aynı yöntem) ───
-async function editWithGPT4o(
-  apiKey: string,
-  imageDataUrl: string,
-  prompt: string
-): Promise<string | null> {
-  const response = await fetch(`${OPENAI_URL}/responses`, {
+async function callResponses(apiKey: string, input: any[], tools?: any[]) {
+  const body: any = { model: "gpt-4o", input };
+  if (tools) body.tools = tools;
+
+  const res = await fetch(`${OPENAI_URL}/responses`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_image",
-              image_url: imageDataUrl,
-            },
-            {
-              type: "input_text",
-              text: prompt,
-            },
-          ],
-        },
-      ],
-      tools: [
-        {
-          type: "image_generation",
-          quality: "high",
-          size: "1024x1024",
-        },
-      ],
-    }),
+    body: JSON.stringify(body),
   });
 
-  if (!response.ok) {
-    const err = await response.text();
-    console.error("GPT-4o error:", err);
+  if (!res.ok) {
+    const err = await res.text();
     throw new Error(err);
   }
 
-  const data = await response.json();
+  return await res.json();
+}
 
-  // Yanıttaki image bloğunu bul
+function extractText(data: any): string {
+  for (const block of data.output || []) {
+    if (block.type === "message") {
+      for (const content of block.content || []) {
+        if (content.type === "output_text") return content.text;
+      }
+    }
+  }
+  return "";
+}
+
+function extractImage(data: any): string | null {
   for (const block of data.output || []) {
     if (block.type === "image_generation_call" && block.result) {
       return `data:image/png;base64,${block.result}`;
     }
-    // Alternatif format
     if (block.type === "message") {
       for (const content of block.content || []) {
-        if (content.type === "image" && content.image_url) {
-          return content.image_url;
-        }
+        if (content.type === "image" && content.image_url) return content.image_url;
+        if (content.type === "image_generation_call" && content.result) return `data:image/png;base64,${content.result}`;
       }
     }
   }
-
-  // data.output doğrudan image içerebilir
-  if (Array.isArray(data.output)) {
-    for (const item of data.output) {
-      if (item.type === "image_generation_call") {
-        return `data:image/png;base64,${item.result}`;
-      }
-    }
-  }
-
-  console.error("No image found in response:", JSON.stringify(data).substring(0, 500));
   return null;
 }
 
-// ─── GPT-4o ile text analizi ───
-async function analyzeWithGPT4o(apiKey: string, imageDataUrl: string): Promise<any> {
-  const response = await fetch(`${OPENAI_URL}/responses`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_image",
-              image_url: imageDataUrl,
-            },
-            {
-              type: "input_text",
-              text: 'Analyze this person for fashion styling. Respond ONLY valid JSON:\n{"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"...","confidence":95}',
-            },
-          ],
-        },
-      ],
-    }),
-  });
-
-  if (!response.ok) throw new Error(await response.text());
-  const data = await response.json();
-
-  // Text yanıtı bul
-  for (const block of data.output || []) {
-    if (block.type === "message") {
-      for (const content of block.content || []) {
-        if (content.type === "output_text") {
-          return JSON.parse(content.text.replace(/```json|```/g, "").trim());
-        }
-      }
-    }
-  }
-
-  throw new Error("No text in response");
-}
-
-// ─── GPT-4o ile kıyafet önerisi ───
-async function getOutfitSuggestions(apiKey: string, analysis: any, style: string, productUrl?: string): Promise<any[]> {
-  const styleLabels: Record<string, string> = {
-    "old-money": "Old Money / Quiet Luxury",
-    streetwear: "Streetwear / Urban",
-    minimal: "Minimalist",
-    "smart-casual": "Smart Casual",
-    luxury: "High Luxury / Designer",
-    sport: "Athleisure",
-  };
-
-  const response = await fetch(`${OPENAI_URL}/responses`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: `World-class stylist. PERSON: ${analysis.gender}, ~${analysis.age}, ${analysis.skinTone} skin (${analysis.undertone}), ${analysis.hairColor} hair, ${analysis.bodyType}.
-STYLE: ${styleLabels[style] || style}
-${productUrl ? "INCLUDE: " + productUrl : ""}
-
-3 outfits. ONLY JSON array:
-[{"name":"Safe Stylish","description":"...","top":"garment fabric color #hex","bottom":"garment fabric color #hex","shoes":"shoe material color","accessories":["item1","item2"],"colors":["#hex1","#hex2","#hex3"],"occasion":"..."},{"name":"Trendy Bold",...},{"name":"Premium Luxury",...}]`,
-            },
-          ],
-        },
-      ],
-    }),
-  });
-
-  if (!response.ok) throw new Error(await response.text());
-  const data = await response.json();
-
-  for (const block of data.output || []) {
-    if (block.type === "message") {
-      for (const content of block.content || []) {
-        if (content.type === "output_text") {
-          return JSON.parse(content.text.replace(/```json|```/g, "").trim());
-        }
-      }
-    }
-  }
-
-  throw new Error("No outfits in response");
-}
-
-// ═══════════════════════════════════════════════════════
-// MAIN
-// ═══════════════════════════════════════════════════════
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -205,55 +69,121 @@ export async function POST(request: NextRequest) {
       ? imageBase64
       : `data:image/jpeg;base64,${imageBase64}`;
 
-    // STEP 1: Analiz
+    // ═══════════════════════════════════════════════
+    // STEP 1: Analyze photo
+    // ═══════════════════════════════════════════════
     console.log("Step 1: Analyzing...");
+
     let analysis;
     try {
-      analysis = await analyzeWithGPT4o(apiKey, imageDataUrl);
+      const data = await callResponses(apiKey, [
+        {
+          role: "user",
+          content: [
+            { type: "input_image", image_url: imageDataUrl },
+            {
+              type: "input_text",
+              text: 'Analyze this person for fashion styling. Respond ONLY valid JSON:\n{"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"...","confidence":95}',
+            },
+          ],
+        },
+      ]);
+      analysis = JSON.parse(extractText(data).replace(/```json|```/g, "").trim());
     } catch (err) {
       console.error("Analysis failed:", err);
       analysis = getMockAnalysis();
     }
 
-    // STEP 2: Kıyafet önerileri
-    console.log("Step 2: Outfit suggestions...");
+    // ═══════════════════════════════════════════════
+    // STEP 2: Outfit suggestions
+    // ═══════════════════════════════════════════════
+    console.log("Step 2: Outfits...");
+
+    const styleLabels: Record<string, string> = {
+      "old-money": "Old Money / Quiet Luxury",
+      streetwear: "Streetwear / Urban",
+      minimal: "Minimalist",
+      "smart-casual": "Smart Casual",
+      luxury: "High Luxury / Designer",
+      sport: "Athleisure",
+    };
+
     let outfits;
     try {
-      outfits = await getOutfitSuggestions(apiKey, analysis, style, productUrl);
+      const data = await callResponses(apiKey, [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: `World-class stylist. PERSON: ${analysis.gender}, ~${analysis.age}, ${analysis.skinTone} skin (${analysis.undertone}), ${analysis.hairColor} hair, ${analysis.bodyType}.\nSTYLE: ${styleLabels[style] || style}\n${productUrl ? "INCLUDE: " + productUrl : ""}\n\n3 outfits. ONLY JSON array:\n[{"name":"Safe Stylish","description":"...","top":"garment fabric color #hex","bottom":"garment fabric color #hex","shoes":"shoe material color","accessories":["item1","item2"],"colors":["#hex1","#hex2","#hex3"],"occasion":"..."},{"name":"Trendy Bold",...},{"name":"Premium Luxury",...}]`,
+            },
+          ],
+        },
+      ]);
+      outfits = JSON.parse(extractText(data).replace(/```json|```/g, "").trim());
     } catch (err) {
       console.error("Outfits failed:", err);
       outfits = getMockOutfits();
     }
 
-    // STEP 3: Her outfit için fotoğrafı düzenle (gpt-4o + image_generation)
-    console.log("Step 3: Editing photos with gpt-4o...");
+    // ═══════════════════════════════════════════════
+    // STEP 3: Edit photo with each outfit
+    // gpt-4o + image_generation tool
+    // ═══════════════════════════════════════════════
+    console.log("Step 3: Editing photos...");
 
     const editResults = await Promise.all(
       outfits.map(async (outfit: any, i: number) => {
         try {
-          const prompt = `Bu fotoğraftaki kişinin fotoğrafını düzenle. 
-
-KESİNLİKLE DEĞİŞTİRME:
-- Yüz, saç, ten rengi, vücut şekli, poz, duruş — hepsi aynı kalacak
-- Arka plan, ışık, kamera açısı — aynı kalacak
-- Elindeki telefon/eşya — aynı kalacak
-
-SADECE KIYAFETLERİ DEĞİŞTİR:
-- Üst: ${outfit.top}
-- Alt: ${outfit.bottom}
-- Ayakkabı: ${outfit.shoes}
-
-AKSESUAR EKLE:
-${outfit.accessories?.map((a: string) => "- " + a).join("\n") || "- Yok"}
-
-Sonuç gerçek bir fotoğraf gibi görünmeli. Kişinin kimliği değişmemeli, sadece kıyafetleri değişmeli.`;
-
           console.log(`  Outfit ${i + 1}/3: ${outfit.name}...`);
-          const result = await editWithGPT4o(apiKey, imageDataUrl, prompt);
-          console.log(`  ${result ? "✅" : "❌"} Outfit ${i + 1}/3`);
-          return result;
+
+          const prompt = `CRITICAL INSTRUCTION: FACE CONSISTENCY & IDENTITY PRESERVATION
+
+You are receiving a real photograph of a specific person. You must return the EXACT SAME photograph with ONLY the clothing changed.
+
+IDENTITY PRESERVATION (highest priority):
+- The person's face is their IDENTITY. Every pixel of their face must be preserved: exact same eyes, eye color, eye shape, eyebrows, nose, nostrils, lips, mouth shape, jawline, chin, cheekbones, forehead, ears, facial hair, wrinkles, moles, freckles, skin texture.
+- Their head shape, hair style, hair color, hair volume, hairline — all identical.
+- Their skin tone across the entire body — identical.
+- Their body proportions, weight, muscle definition — identical.
+- Their exact pose, posture, stance, arm angle, hand position, finger placement — identical.
+- Any items they are holding or wearing that are NOT clothing (phone, glasses, watch) — keep them.
+
+BACKGROUND PRESERVATION:
+- The environment, walls, floor, objects, lighting direction, shadow angles, color temperature, reflections — all identical. Not similar. Identical.
+
+CLOTHING CHANGES (the ONLY thing you modify):
+- Replace their current top/shirt with: ${outfit.top}
+- Replace their current bottom/pants with: ${outfit.bottom}
+- Replace their footwear with: ${outfit.shoes}
+
+ACCESSORIES TO ADD:
+${outfit.accessories?.map((a: string) => "- " + a).join("\n") || "- None"}
+
+The new clothing must fit their exact body shape with realistic fabric draping, wrinkles, and shadows that match the existing lighting. The final result must look like the original unedited photo — as if the person was actually wearing these clothes when the picture was taken.
+
+REMEMBER: If the face changes even 1%, the entire output is a failure. Face identity = #1 priority.`;
+
+          const data = await callResponses(
+            apiKey,
+            [
+              {
+                role: "user",
+                content: [
+                  { type: "input_image", image_url: imageDataUrl },
+                  { type: "input_text", text: prompt },
+                ],
+              },
+            ],
+            [{ type: "image_generation", quality: "high", size: "1024x1024" }]
+          );
+
+          const image = extractImage(data);
+          console.log(`  ${image ? "✅" : "❌"} Outfit ${i + 1}/3`);
+          return image;
         } catch (err: any) {
-          console.error(`  Failed ${i + 1}/3:`, err?.message?.substring(0, 200) || err);
+          console.error(`  Failed ${i + 1}/3:`, err?.message?.substring(0, 300) || err);
           return null;
         }
       })
