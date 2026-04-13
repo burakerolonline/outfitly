@@ -4,34 +4,40 @@ import sharp from "sharp";
 export const maxDuration = 120;
 const API = "https://api.openai.com/v1";
 
-// ─────────────────────────────────────────────────────────────
-// STEP 1 & 2: GPT-4o Vision ile analiz ve kıyafet önerileri
-// ─────────────────────────────────────────────────────────────
+// ─── Analiz ve kıyafet metni için (gpt-4o-mini — verification gerektirmez) ───
 async function responsesText(apiKey: string, input: any[]): Promise<string> {
-  const res = await fetch(`${API}/responses`, {
+  const res = await fetch(`${API}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "gpt-4o", input }),
+    body: JSON.stringify({ model: "gpt-4o-mini", messages: input, max_tokens: 1500 }),
   });
   if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).substring(0, 300)}`);
   const data = await res.json();
-  for (const b of data.output || [])
-    if (b.type === "message")
-      for (const c of b.content || [])
-        if (c.type === "output_text") return c.text;
-  return "";
+  return data.choices?.[0]?.message?.content || "";
 }
 
-// ─────────────────────────────────────────────────────────────
-// STEP 3: gpt-image-1 /v1/images/edits ile GERÇEK IMAGE EDITING
-//
-// Eski kod: /v1/responses + image_generation tool = sıfırdan üretim
-//           → farklı kişi çıkıyor (ChatGPT'nin sorunu da aynıydı)
-//
-// Yeni kod: /v1/images/edits + gpt-image-1 = VAR OLAN fotoğrafı edit
-//           → aynı yüz, aynı kişi, sadece kıyafet değişir
-//           → ChatGPT'nin "görsel yükle ve düzenle" özelliği de budur
-// ─────────────────────────────────────────────────────────────
+async function analyzeImage(apiKey: string, jpgDataUrl: string): Promise<string> {
+  const res = await fetch(`${API}/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: jpgDataUrl } },
+          { type: "text", text: 'Analyze this person. Return ONLY valid JSON: {"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"25-30","confidence":95}' },
+        ],
+      }],
+      max_tokens: 300,
+    }),
+  });
+  if (!res.ok) throw new Error(`Vision ${res.status}: ${(await res.text()).substring(0, 300)}`);
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content || "";
+}
+
+// ─── gpt-image-1 ile görsel düzenleme (PARALEL çalışır) ───────────────────────
 async function editImageWithGptImage1(
   apiKey: string,
   imagePngBuffer: Buffer,
@@ -64,9 +70,8 @@ async function editImageWithGptImage1(
 
     if (!res.ok) {
       const errText = await res.text();
-      // gpt-image-1 erişiminiz yoksa Responses API'ye fallback
       if (res.status === 404 || errText.includes("model") || errText.includes("not_found")) {
-        console.log("[gpt-image-1] model bulunamadı, Responses API fallback...");
+        console.log("[gpt-image-1] erişim yok, Responses API fallback...");
         return await fallbackResponsesImage(apiKey, imagePngBuffer, outfit);
       }
       return { image: null, debug: `HTTP ${res.status}: ${errText.substring(0, 300)}` };
@@ -85,9 +90,7 @@ async function editImageWithGptImage1(
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// FALLBACK: Responses API (gpt-image-1 erişimi yoksa)
-// ─────────────────────────────────────────────────────────────
+// ─── Fallback: Responses API ──────────────────────────────────────────────────
 async function fallbackResponsesImage(
   apiKey: string,
   imagePngBuffer: Buffer,
@@ -133,46 +136,36 @@ async function fallbackResponsesImage(
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// ANA POST HANDLER
-// ─────────────────────────────────────────────────────────────
+// ─── ANA HANDLER ─────────────────────────────────────────────────────────────
 export async function POST(request: NextRequest) {
   try {
     const { imageBase64, style, productUrl } = await request.json();
     if (!imageBase64 || !style) return NextResponse.json({ error: "Missing data" }, { status: 400 });
 
     const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json({ success: true, mode: "mock", analysis: mockA(), outfits: mockO() });
-    }
+    if (!apiKey) return NextResponse.json({ success: true, mode: "mock", analysis: mockA(), outfits: mockO() });
 
     const raw = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), "base64");
 
-    // PNG buffer: gpt-image-1 edits endpoint için (zorunlu format)
+    // PNG: gpt-image-1 edits için
     const pngBuffer = await sharp(raw)
       .resize(1024, 1024, { fit: "cover", position: "attention" })
       .png({ compressionLevel: 7 })
       .toBuffer();
 
-    // JPEG data URL: GPT-4o analiz ve kıyafet üretimi için (daha küçük, daha hızlı)
+    // JPEG: analiz için (daha küçük)
     const jpgDataUrl = `data:image/jpeg;base64,${(
-      await sharp(raw).resize(1024, 1024, { fit: "cover", position: "attention" }).jpeg({ quality: 85 }).toBuffer()
+      await sharp(raw).resize(800, 800, { fit: "cover", position: "attention" }).jpeg({ quality: 80 }).toBuffer()
     ).toString("base64")}`;
 
-    // ── STEP 1: Fotoğraf Analizi ──────────────────────────
+    // ── STEP 1: Analiz (gpt-4o-mini) ─────────────────────
     let analysis: any;
     try {
-      const r = await responsesText(apiKey, [{
-        role: "user",
-        content: [
-          { type: "input_image", image_url: jpgDataUrl },
-          { type: "input_text", text: 'Analyze this person. Return ONLY valid JSON: {"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"25-30","confidence":95}' },
-        ],
-      }]);
+      const r = await analyzeImage(apiKey, jpgDataUrl);
       analysis = JSON.parse(r.replace(/```json|```/g, "").trim());
     } catch { analysis = mockA(); }
 
-    // ── STEP 2: Kıyafet Önerileri ─────────────────────────
+    // ── STEP 2: Kıyafet önerileri (gpt-4o-mini) ──────────
     const styleLabels: Record<string, string> = {
       "old-money": "Old Money", streetwear: "Streetwear", minimal: "Minimalist",
       "smart-casual": "Smart Casual", luxury: "Luxury", sport: "Athleisure",
@@ -181,26 +174,26 @@ export async function POST(request: NextRequest) {
     try {
       const r = await responsesText(apiKey, [{
         role: "user",
-        content: [{ type: "input_text", text: `Stylist. ${analysis.gender}, ${analysis.age}, ${analysis.skinTone} (${analysis.undertone}), ${analysis.hairColor}, ${analysis.bodyType}. STYLE: ${styleLabels[style] || style}. ${productUrl || ""} Generate 3 outfits. Return ONLY JSON array: [{"name":"Safe Stylish","description":"...","top":"detailed description","bottom":"detailed description","shoes":"detailed description","accessories":["..."],"colors":["#hex","#hex","#hex"],"occasion":"..."},{"name":"Trendy Bold",...},{"name":"Premium Luxury",...}]` }],
+        content: `Stylist. ${analysis.gender}, ${analysis.age}, ${analysis.skinTone} (${analysis.undertone}), ${analysis.hairColor}, ${analysis.bodyType}. STYLE: ${styleLabels[style] || style}. ${productUrl || ""} Generate 3 outfits. Return ONLY JSON array: [{"name":"Safe Stylish","description":"...","top":"detailed description","bottom":"detailed description","shoes":"detailed description","accessories":["..."],"colors":["#hex","#hex","#hex"],"occasion":"..."},{"name":"Trendy Bold",...},{"name":"Premium Luxury",...}]`,
       }]);
       outfits = JSON.parse(r.replace(/```json|```/g, "").trim());
     } catch { outfits = mockO(); }
 
-    // ── STEP 3: gpt-image-1 ile Görsel Üretimi ────────────
-    const results: { image: string | null; debug: string }[] = [];
-    for (let i = 0; i < outfits.length; i++) {
-      const o = outfits[i];
-      console.log(`[${i + 1}/3] "${o.name}" işleniyor...`);
-      const r = await editImageWithGptImage1(apiKey, pngBuffer, {
-        top: o.top, bottom: o.bottom, shoes: o.shoes, accessories: o.accessories || [],
-      });
-      results.push(r);
-      console.log(`[${i + 1}/3] ${r.image ? "✅" : "❌"} ${r.debug}`);
-    }
+    // ── STEP 3: Görsel üretimi — 3'ü PARALEL ─────────────
+    console.log("3 görsel paralel üretiliyor...");
+    const results = await Promise.all(
+      outfits.map((o: any, i: number) => {
+        console.log(`[${i + 1}/3] "${o.name}" başlatıldı`);
+        return editImageWithGptImage1(apiKey, pngBuffer, {
+          top: o.top, bottom: o.bottom, shoes: o.shoes, accessories: o.accessories || [],
+        });
+      })
+    );
+    results.forEach((r, i) => console.log(`[${i + 1}/3] ${r.image ? "✅" : "❌"} ${r.debug}`));
 
     return NextResponse.json({
       success: true,
-      mode: "gpt-image-1-edits",
+      mode: "gpt-image-1-edits-parallel",
       analysis: {
         skinTone: analysis.skinTone || "Medium", undertone: analysis.undertone || "Neutral",
         faceShape: analysis.faceShape || "Oval", bodyType: analysis.bodyType || "Mesomorph",
