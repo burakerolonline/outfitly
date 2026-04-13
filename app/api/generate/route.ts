@@ -1,13 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI, { toFile } from "openai";
 
-// ═══════════════════════════════════════════════════════
-// Yöntem 1 (öncelikli): Responses API + image_generation
-//   → ChatGPT'nin yöntemi, yüzü en iyi koruyan
-// Yöntem 2 (yedek): images.edit + gpt-image-1
-//   → Çalıştığı kanıtlanmış, yüz koruması daha zayıf
-// ═══════════════════════════════════════════════════════
-
 export const maxDuration = 120;
 
 function getClient(): OpenAI | null {
@@ -16,21 +9,20 @@ function getClient(): OpenAI | null {
   return new OpenAI({ apiKey });
 }
 
-// ─── Yöntem 1: Responses API (ChatGPT'nin kullandığı) ───
+// ─── Yöntem 1: Responses API (ChatGPT'nin yöntemi) ───
 async function editWithResponsesAPI(
   client: OpenAI,
   imageDataUrl: string,
   prompt: string
 ): Promise<string | null> {
   try {
-    // @ts-ignore - responses API may not be in older type definitions
-    const response = await client.responses.create({
+    const response = await (client as any).responses.create({
       model: "gpt-4o",
       input: [
         {
           role: "user",
           content: [
-            { type: "input_image", image_url: imageDataUrl },
+            { type: "input_image", image_url: imageDataUrl, detail: "high" },
             { type: "input_text", text: prompt },
           ],
         },
@@ -38,35 +30,22 @@ async function editWithResponsesAPI(
       tools: [{ type: "image_generation", quality: "high", size: "1024x1024" }],
     });
 
-    // Response'dan image'ı çıkar
     const output = response?.output;
-    if (!output || !Array.isArray(output)) {
-      console.log("  Responses API: no output array");
-      return null;
-    }
+    if (!output || !Array.isArray(output)) return null;
 
     for (const block of output) {
-      // Direkt image_generation_call bloğu
       if (block.type === "image_generation_call" && block.result) {
-        console.log("  Responses API: found image_generation_call");
         return `data:image/png;base64,${block.result}`;
       }
-      // Message içinde nested
       if (block.type === "message" && block.content) {
         for (const content of block.content) {
-          if (content.type === "image" && content.image_url) {
-            console.log("  Responses API: found image in message");
-            return content.image_url;
-          }
+          if (content.type === "image" && content.image_url) return content.image_url;
           if (content.type === "image_generation_call" && content.result) {
-            console.log("  Responses API: found image_generation_call in message");
             return `data:image/png;base64,${content.result}`;
           }
         }
       }
     }
-
-    console.log("  Responses API: image not found in output. Keys:", JSON.stringify(output.map((b: any) => b.type)));
     return null;
   } catch (err: any) {
     console.error("  Responses API error:", err?.message?.substring(0, 300) || err);
@@ -88,7 +67,6 @@ async function editWithImagesAPI(
       n: 1,
       size: "1024x1024",
     });
-
     const result = response.data?.[0];
     if (result?.b64_json) return `data:image/png;base64,${result.b64_json}`;
     if (result?.url) return result.url;
@@ -99,37 +77,35 @@ async function editWithImagesAPI(
   }
 }
 
-// ─── Yüz koruma prompt'u oluştur ───
+// ─── Prompt ───
 function buildEditPrompt(outfit: any, analysis: any): string {
   return `CRITICAL: FACE & IDENTITY PRESERVATION
 
-You are editing a real photograph. The person in this photo has these EXACT features that MUST NOT change:
-- Gender: ${analysis.gender}
-- Age: approximately ${analysis.age}
-- Skin tone: ${analysis.skinTone} with ${analysis.undertone} undertone
-- Hair: ${analysis.hairColor}
-- Face shape: ${analysis.faceShape}
-- Body type: ${analysis.bodyType}
+You are editing a real photograph. The person has these EXACT features that MUST NOT change:
+- Gender: ${analysis.gender}, Age: ~${analysis.age}
+- Skin: ${analysis.skinTone}, ${analysis.undertone} undertone
+- Hair: ${analysis.hairColor}, Face: ${analysis.faceShape}
+- Body: ${analysis.bodyType}
 
 ABSOLUTE RULES:
-- Every pixel of their face must remain IDENTICAL: eyes, nose, mouth, jawline, eyebrows, facial hair, skin texture, moles, freckles — everything.
+- Every pixel of their face must remain IDENTICAL: eyes, nose, mouth, jawline, eyebrows, facial hair, skin texture, moles, freckles.
 - Hair style, color, volume, hairline — IDENTICAL.
-- Body shape, proportions, weight, muscle definition — IDENTICAL.
-- Pose, posture, arm angles, hand positions, finger placement — IDENTICAL.
-- Objects they hold (phone, bag) — keep exactly as they are.
-- Background, environment, lighting, shadows, reflections — IDENTICAL.
+- Body shape, proportions, weight — IDENTICAL.
+- Pose, posture, arm angles, hand positions — IDENTICAL.
+- Objects they hold (phone, glasses) — keep exactly as they are.
+- Background, lighting, shadows, reflections — IDENTICAL.
 
 ONLY CHANGE CLOTHING:
 - Top: ${outfit.top}
 - Bottom: ${outfit.bottom}
 - Shoes: ${outfit.shoes}
 
-ADD THESE ACCESSORIES:
+ADD ACCESSORIES:
 ${outfit.accessories?.map((a: string) => "- " + a).join("\n") || "- None"}
 
-The clothing must wrap naturally around their body with realistic fabric physics. The result must be indistinguishable from the original photo — as if the person was actually wearing these clothes.
+Clothing must fit naturally with realistic fabric draping matching the lighting. Result must look like the original photo — as if the person was wearing these clothes when the picture was taken.
 
-If the face changes even 1%, the output is a FAILURE. Identity preservation is the #1 priority.`;
+If the face changes even 1%, the output is a FAILURE.`;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -206,41 +182,36 @@ export async function POST(request: NextRequest) {
     // ═══ STEP 3: Edit photos ═══
     console.log("Step 3: Editing photos...");
 
-    // images.edit için dosya hazırla
     const base64Clean = imageBase64.replace(/^data:image\/\w+;base64,/, "");
     const imageBuffer = Buffer.from(base64Clean, "base64");
     const imageFile = await toFile(imageBuffer, "photo.png", { type: "image/png" });
 
-    // Önce Responses API'yi test et (ilk outfit ile)
+    // Test Responses API first
     console.log("  Testing Responses API...");
     const testPrompt = buildEditPrompt(outfits[0], analysis);
     const testResult = await editWithResponsesAPI(client, imageDataUrl, testPrompt);
     const useResponsesAPI = testResult !== null;
-    console.log(`  Responses API ${useResponsesAPI ? "✅ WORKS" : "❌ FAILED, using images.edit fallback"}`);
+    console.log(`  Responses API ${useResponsesAPI ? "WORKS" : "FAILED, using images.edit"}`);
 
     let editResults: (string | null)[];
 
     if (useResponsesAPI) {
-      // Responses API çalışıyor — tüm outfitler için kullan
       editResults = [testResult];
       const remaining = await Promise.all(
         outfits.slice(1).map(async (outfit: any, i: number) => {
-          console.log(`  Outfit ${i + 2}/3: ${outfit.name} (Responses API)...`);
-          const prompt = buildEditPrompt(outfit, analysis);
-          const result = await editWithResponsesAPI(client, imageDataUrl, prompt);
-          console.log(`  ${result ? "✅" : "❌"} ${i + 2}/3`);
+          console.log(`  Outfit ${i + 2}/3 (Responses API)...`);
+          const result = await editWithResponsesAPI(client, imageDataUrl, buildEditPrompt(outfit, analysis));
+          console.log(`  ${result ? "OK" : "FAIL"} ${i + 2}/3`);
           return result;
         })
       );
       editResults.push(...remaining);
     } else {
-      // images.edit fallback — tüm outfitler
       editResults = await Promise.all(
         outfits.map(async (outfit: any, i: number) => {
-          console.log(`  Outfit ${i + 1}/3: ${outfit.name} (images.edit)...`);
-          const prompt = buildEditPrompt(outfit, analysis);
-          const result = await editWithImagesAPI(client, imageFile, prompt);
-          console.log(`  ${result ? "✅" : "❌"} ${i + 1}/3`);
+          console.log(`  Outfit ${i + 1}/3 (images.edit)...`);
+          const result = await editWithImagesAPI(client, imageFile, buildEditPrompt(outfit, analysis));
+          console.log(`  ${result ? "OK" : "FAIL"} ${i + 1}/3`);
           return result;
         })
       );
