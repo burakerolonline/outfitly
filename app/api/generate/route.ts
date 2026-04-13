@@ -48,7 +48,7 @@ async function editImageWithGptImage1(
     ].join(" ");
 
     const formData = new FormData();
-    const pngBlob = new Blob([imagePngBuffer], { type: "image/png" });
+    const pngBlob = new Blob([new Uint8Array(imagePngBuffer)], { type: "image/png" });
     formData.append("image", pngBlob, "person.png");
     formData.append("prompt", prompt);
     formData.append("model", "gpt-image-1");
