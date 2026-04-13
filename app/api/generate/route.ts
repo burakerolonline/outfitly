@@ -34,55 +34,23 @@ async function gptText(apiKey: string, prompt: string): Promise<string> {
   return (await res.json()).choices?.[0]?.message?.content || "";
 }
 
-// ─── MASK: üst %35 korunur (yüz), alt %65 edit edilir (kıyafet) ──────────────
+// ─── MASK: üst %45 korunur (yüz + boyun + omuz üstü), alt %55 edit edilir (kıyafet) ──
+// Kural: transparent (alpha=0) = AI tarafından düzenlenir, opaque (alpha=255) = korunur
+// %45 → yüz + saç + boyun + omuz başlangıcını tam kapsar
 async function createMask(width: number, height: number): Promise<Buffer> {
-  const preserveHeight = Math.floor(height * 0.35);
+  const preserveHeight = Math.floor(height * 0.45);
   const base = await sharp({
-    create: { width, height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+    create: { width, height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }, // transparent = AI edits
   }).png().toBuffer();
   const faceBlock = await sharp({
-    create: { width, height: preserveHeight, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 255 } },
+    create: { width, height: preserveHeight, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 255 } }, // opaque = preserved
   }).png().toBuffer();
   return sharp(base).composite([{ input: faceBlock, top: 0, left: 0 }]).png().toBuffer();
 }
 
-// ─── FACE RESTORE: üretilen görselin üstüne orijinal yüzü yapıştır ────────────
-// Bu adım yüzün %100 orijinal kalmasını GARANTI eder
-// gpt-image-1 ne kadar değiştirirse değiştirsin, biz üstüne orijinali koyuyoruz
-async function restoreOriginalFace(
-  originalPng: Buffer,
-  generatedBase64: string,
-  facePercent: number = 0.40  // %40 — saç dahil yüzü kapsar
-): Promise<string> {
-  try {
-    const { width = 1024, height = 1024 } = await sharp(originalPng).metadata();
-    const faceHeight = Math.floor(height * facePercent);
-
-    // Orijinal fotoğraftan yüz bölgesini kes
-    const originalFaceRegion = await sharp(originalPng)
-      .extract({ left: 0, top: 0, width, height: faceHeight })
-      .toBuffer();
-
-    // Üretilen görseli decode et
-    const generatedBuffer = Buffer.from(
-      generatedBase64.replace(/^data:image\/\w+;base64,/, ""),
-      "base64"
-    );
-
-    // Üretilen görselin üstüne orijinal yüzü yapıştır
-    const finalBuffer = await sharp(generatedBuffer)
-      .resize(width, height) // boyutları eşitle
-      .composite([{ input: originalFaceRegion, top: 0, left: 0 }])
-      .png()
-      .toBuffer();
-
-    return `data:image/png;base64,${finalBuffer.toString("base64")}`;
-  } catch (e: any) {
-    // Hata olursa orijinal üretilen görseli dön
-    console.error("restoreOriginalFace error:", e?.message);
-    return generatedBase64;
-  }
-}
+// ─── FACE RESTORE: KALDIRILDI ─────────────────────────────────────────────────
+// Sebebi: hard rectangular paste (top %40 kopyala yapıştır) yüzde görünür seam
+// ve renk uyumsuzluğu yaratıyordu. Mask (%45 preserve) yeterli korumayı sağlar.
 
 // ─── INPAINTING + FACE RESTORE ────────────────────────────────────────────────
 async function inpaintOutfit(
@@ -127,11 +95,9 @@ async function inpaintOutfit(
       return { image: null, debug: `Beklenmedik yanıt: ${JSON.stringify(data).substring(0, 200)}` };
     }
 
-    // ── FACE RESTORE: orijinal yüzü üstüne yapıştır ──────
-    // Bu adım olmadan AI yüzü değiştirebilir — bu adımla %100 orijinal kalır
-    const finalImage = await restoreOriginalFace(pngBuffer, generatedImage);
-
-    return { image: finalImage, debug: "inpainting + face restore ✓" };
+    // Mask doğru çalıştığında (%45 preserve) face restore gereksiz ve zararlı.
+    // Direkt üretilen görseli döndür.
+    return { image: generatedImage, debug: "inpainting ✓" };
   } catch (e: any) {
     return { image: null, debug: `Exception: ${e?.message?.substring(0, 200)}` };
   }
@@ -148,9 +114,10 @@ export async function POST(request: NextRequest) {
 
     const raw = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), "base64");
 
-    // PNG 1024x1024 — inpainting + face restore için
+    // PNG 1024x1024 — inpainting için
+    // position: "top" → yüz her zaman üstte kalır, attention gibi tahmin edilemez kırpma olmaz
     const pngBuffer = await sharp(raw)
-      .resize(1024, 1024, { fit: "cover", position: "attention" })
+      .resize(1024, 1024, { fit: "cover", position: "top" })
       .png({ compressionLevel: 7 })
       .toBuffer();
 
@@ -184,7 +151,7 @@ export async function POST(request: NextRequest) {
       outfits = JSON.parse(r.replace(/```json|```/g, "").trim());
     } catch { outfits = mockO(); }
 
-    // ── STEP 3: Paralel inpainting + face restore ─────────
+    // ── STEP 3: Paralel inpainting ─────────────────────────
     console.log("3 görsel paralel inpainting başlatıldı...");
     const results = await Promise.all(
       outfits.map((o: any, i: number) => {
@@ -198,7 +165,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      mode: "inpainting-face-restore",
+      mode: "inpainting",
       analysis: {
         skinTone: analysis.skinTone || "Medium", undertone: analysis.undertone || "Neutral",
         faceShape: analysis.faceShape || "Oval", bodyType: analysis.bodyType || "Mesomorph",

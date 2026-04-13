@@ -260,7 +260,7 @@ export default function ResultsPage({ onNavigate }: { onNavigate: (page: string)
           {/* AI Prompt Preview */}
           <details className="mt-6 rounded-2xl overflow-hidden" style={{ background: "var(--bg-card)", border: "1px solid var(--border)" }}>
             <summary className="px-6 py-4 cursor-pointer text-sm font-semibold" style={{ color: "var(--text-muted)" }}>
-              View AI Prompts Used (GPT-4o + DALL-E 3)
+              View AI Prompts Used (GPT-4o + gpt-image-1)
             </summary>
             <pre className="font-mono text-xs leading-relaxed whitespace-pre-wrap overflow-auto"
               style={{ padding: "16px 24px", color: "var(--text-dim)", borderTop: "1px solid var(--border)", background: "var(--surface)", maxHeight: 300 }}>
