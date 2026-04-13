@@ -1,54 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
+import OpenAI, { toFile } from "openai";
 
-const OPENAI_URL = "https://api.openai.com/v1";
+// ═══════════════════════════════════════════════════════
+// gpt-4o      → analiz + kıyafet önerisi (text)
+// gpt-image-1 → fotoğraf düzenleme (ChatGPT'nin aynı motoru)
+// ═══════════════════════════════════════════════════════
 
 export const maxDuration = 120;
 
-async function callResponses(apiKey: string, input: any[], tools?: any[]) {
-  const body: any = { model: "gpt-4o", input };
-  if (tools) body.tools = tools;
-
-  const res = await fetch(`${OPENAI_URL}/responses`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err);
-  }
-
-  return await res.json();
-}
-
-function extractText(data: any): string {
-  for (const block of data.output || []) {
-    if (block.type === "message") {
-      for (const content of block.content || []) {
-        if (content.type === "output_text") return content.text;
-      }
-    }
-  }
-  return "";
-}
-
-function extractImage(data: any): string | null {
-  for (const block of data.output || []) {
-    if (block.type === "image_generation_call" && block.result) {
-      return `data:image/png;base64,${block.result}`;
-    }
-    if (block.type === "message") {
-      for (const content of block.content || []) {
-        if (content.type === "image" && content.image_url) return content.image_url;
-        if (content.type === "image_generation_call" && content.result) return `data:image/png;base64,${content.result}`;
-      }
-    }
-  }
-  return null;
+function getClient(): OpenAI | null {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+  return new OpenAI({ apiKey });
 }
 
 export async function POST(request: NextRequest) {
@@ -60,8 +23,8 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Missing image or style" }, { status: 400 });
     }
 
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
+    const client = getClient();
+    if (!client) {
       return NextResponse.json({ success: true, mode: "mock", analysis: getMockAnalysis(), outfits: getMockOutfits() });
     }
 
@@ -70,32 +33,33 @@ export async function POST(request: NextRequest) {
       : `data:image/jpeg;base64,${imageBase64}`;
 
     // ═══════════════════════════════════════════════
-    // STEP 1: Analyze photo
+    // STEP 1: gpt-4o → Analyze photo
     // ═══════════════════════════════════════════════
     console.log("Step 1: Analyzing...");
 
     let analysis;
     try {
-      const data = await callResponses(apiKey, [
-        {
+      const res = await client.chat.completions.create({
+        model: "gpt-4o",
+        max_tokens: 400,
+        temperature: 0.3,
+        messages: [{
           role: "user",
           content: [
-            { type: "input_image", image_url: imageDataUrl },
-            {
-              type: "input_text",
-              text: 'Analyze this person for fashion styling. Respond ONLY valid JSON:\n{"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"...","confidence":95}',
-            },
+            { type: "text", text: 'Analyze this person for fashion styling. Respond ONLY valid JSON:\n{"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"...","confidence":95}' },
+            { type: "image_url", image_url: { url: imageDataUrl } },
           ],
-        },
-      ]);
-      analysis = JSON.parse(extractText(data).replace(/```json|```/g, "").trim());
+        }],
+      });
+      const raw = res.choices[0]?.message?.content || "";
+      analysis = JSON.parse(raw.replace(/```json|```/g, "").trim());
     } catch (err) {
-      console.error("Analysis failed:", err);
+      console.error("Analysis error:", err);
       analysis = getMockAnalysis();
     }
 
     // ═══════════════════════════════════════════════
-    // STEP 2: Outfit suggestions
+    // STEP 2: gpt-4o → Outfit suggestions
     // ═══════════════════════════════════════════════
     console.log("Step 2: Outfits...");
 
@@ -110,28 +74,30 @@ export async function POST(request: NextRequest) {
 
     let outfits;
     try {
-      const data = await callResponses(apiKey, [
-        {
+      const res = await client.chat.completions.create({
+        model: "gpt-4o",
+        max_tokens: 2000,
+        temperature: 0.7,
+        messages: [{
           role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: `World-class stylist. PERSON: ${analysis.gender}, ~${analysis.age}, ${analysis.skinTone} skin (${analysis.undertone}), ${analysis.hairColor} hair, ${analysis.bodyType}.\nSTYLE: ${styleLabels[style] || style}\n${productUrl ? "INCLUDE: " + productUrl : ""}\n\n3 outfits. ONLY JSON array:\n[{"name":"Safe Stylish","description":"...","top":"garment fabric color #hex","bottom":"garment fabric color #hex","shoes":"shoe material color","accessories":["item1","item2"],"colors":["#hex1","#hex2","#hex3"],"occasion":"..."},{"name":"Trendy Bold",...},{"name":"Premium Luxury",...}]`,
-            },
-          ],
-        },
-      ]);
-      outfits = JSON.parse(extractText(data).replace(/```json|```/g, "").trim());
+          content: `World-class stylist. PERSON: ${analysis.gender}, ~${analysis.age}, ${analysis.skinTone} skin (${analysis.undertone}), ${analysis.hairColor} hair, ${analysis.bodyType}.\nSTYLE: ${styleLabels[style] || style}\n${productUrl ? "INCLUDE: " + productUrl : ""}\n\n3 outfits. ONLY JSON array:\n[{"name":"Safe Stylish","description":"...","top":"garment fabric color #hex","bottom":"garment fabric color #hex","shoes":"shoe material color","accessories":["item1","item2"],"colors":["#hex1","#hex2","#hex3"],"occasion":"..."},{"name":"Trendy Bold",...},{"name":"Premium Luxury",...}]`,
+        }],
+      });
+      const raw = res.choices[0]?.message?.content || "";
+      outfits = JSON.parse(raw.replace(/```json|```/g, "").trim());
     } catch (err) {
-      console.error("Outfits failed:", err);
+      console.error("Outfits error:", err);
       outfits = getMockOutfits();
     }
 
     // ═══════════════════════════════════════════════
-    // STEP 3: Edit photo with each outfit
-    // gpt-4o + image_generation tool
+    // STEP 3: gpt-image-1 → Edit YOUR photo
     // ═══════════════════════════════════════════════
     console.log("Step 3: Editing photos...");
+
+    const base64Clean = imageBase64.replace(/^data:image\/\w+;base64,/, "");
+    const imageBuffer = Buffer.from(base64Clean, "base64");
+    const imageFile = await toFile(imageBuffer, "photo.png", { type: "image/png" });
 
     const editResults = await Promise.all(
       outfits.map(async (outfit: any, i: number) => {
@@ -140,7 +106,7 @@ export async function POST(request: NextRequest) {
 
           const prompt = `CRITICAL INSTRUCTION: FACE CONSISTENCY & IDENTITY PRESERVATION
 
-You are receiving a real photograph of a specific person. You must return the EXACT SAME photograph with ONLY the clothing changed.
+You are editing a real photograph of a specific person. You must return the EXACT SAME photograph with ONLY the clothing changed.
 
 IDENTITY PRESERVATION (highest priority):
 - The person's face is their IDENTITY. Every pixel of their face must be preserved: exact same eyes, eye color, eye shape, eyebrows, nose, nostrils, lips, mouth shape, jawline, chin, cheekbones, forehead, ears, facial hair, wrinkles, moles, freckles, skin texture.
@@ -148,42 +114,44 @@ IDENTITY PRESERVATION (highest priority):
 - Their skin tone across the entire body — identical.
 - Their body proportions, weight, muscle definition — identical.
 - Their exact pose, posture, stance, arm angle, hand position, finger placement — identical.
-- Any items they are holding or wearing that are NOT clothing (phone, glasses, watch) — keep them.
+- Any items they are holding or wearing that are NOT clothing (phone, glasses, watch) — keep them exactly as they are.
 
 BACKGROUND PRESERVATION:
-- The environment, walls, floor, objects, lighting direction, shadow angles, color temperature, reflections — all identical. Not similar. Identical.
+- The environment, walls, floor, objects, lighting direction, shadow angles, color temperature, reflections — all identical. Not similar. IDENTICAL.
 
 CLOTHING CHANGES (the ONLY thing you modify):
 - Replace their current top/shirt with: ${outfit.top}
 - Replace their current bottom/pants with: ${outfit.bottom}
 - Replace their footwear with: ${outfit.shoes}
 
-ACCESSORIES TO ADD:
+ACCESSORIES TO ADD (place naturally on the person):
 ${outfit.accessories?.map((a: string) => "- " + a).join("\n") || "- None"}
 
-The new clothing must fit their exact body shape with realistic fabric draping, wrinkles, and shadows that match the existing lighting. The final result must look like the original unedited photo — as if the person was actually wearing these clothes when the picture was taken.
+The new clothing must fit their exact body shape with realistic fabric draping, wrinkles, and shadows matching the existing lighting. The result must look like the original unedited photo — as if the person was wearing these clothes when the picture was taken.
 
 REMEMBER: If the face changes even 1%, the entire output is a failure. Face identity = #1 priority.`;
 
-          const data = await callResponses(
-            apiKey,
-            [
-              {
-                role: "user",
-                content: [
-                  { type: "input_image", image_url: imageDataUrl },
-                  { type: "input_text", text: prompt },
-                ],
-              },
-            ],
-            [{ type: "image_generation", quality: "high", size: "1024x1024" }]
-          );
+          const response = await client.images.edit({
+            model: "gpt-image-1",
+            image: imageFile,
+            prompt: prompt,
+            n: 1,
+            size: "1024x1024",
+          });
 
-          const image = extractImage(data);
-          console.log(`  ${image ? "✅" : "❌"} Outfit ${i + 1}/3`);
-          return image;
+          const result = response.data?.[0];
+          if (result?.b64_json) {
+            console.log(`  ✅ ${i + 1}/3 done`);
+            return `data:image/png;base64,${result.b64_json}`;
+          }
+          if (result?.url) {
+            console.log(`  ✅ ${i + 1}/3 done`);
+            return result.url;
+          }
+          console.log(`  ⚠️ ${i + 1}/3 no image returned`);
+          return null;
         } catch (err: any) {
-          console.error(`  Failed ${i + 1}/3:`, err?.message?.substring(0, 300) || err);
+          console.error(`  ❌ ${i + 1}/3 failed:`, err?.message || err);
           return null;
         }
       })
@@ -201,11 +169,11 @@ REMEMBER: If the face changes even 1%, the entire output is a failure. Face iden
       generatedImage: editResults[i] || null,
     }));
 
-    console.log("Done!");
+    console.log("All done!");
 
     return NextResponse.json({
       success: true,
-      mode: "gpt-4o",
+      mode: "gpt-image-1",
       analysis: {
         skinTone: analysis.skinTone || "Medium",
         undertone: analysis.undertone || "Neutral",
