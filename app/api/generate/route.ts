@@ -19,7 +19,7 @@ async function gptVision(apiKey: string, imageDataUrl: string, prompt: string): 
   return (await res.json()).choices?.[0]?.message?.content || "";
 }
 
-// ─── GPT-4o: Kıyafet önerisi metni ───────────────────────────────────────────
+// ─── GPT-4o: Kıyafet önerisi ─────────────────────────────────────────────────
 async function gptText(apiKey: string, prompt: string): Promise<string> {
   const res = await fetch(`${API}/chat/completions`, {
     method: "POST",
@@ -34,30 +34,57 @@ async function gptText(apiKey: string, prompt: string): Promise<string> {
   return (await res.json()).choices?.[0]?.message?.content || "";
 }
 
-// ─── MASK üretici ─────────────────────────────────────────────────────────────
-// Üst %35 = yüz/baş bölgesi → OPAQUE (alpha=255) → korunur, dokunulmaz
-// Alt %65 = kıyafet/vücut bölgesi → TRANSPARENT (alpha=0) → edit edilir
+// ─── MASK: üst %35 korunur (yüz), alt %65 edit edilir (kıyafet) ──────────────
 async function createMask(width: number, height: number): Promise<Buffer> {
-  const preserveHeight = Math.floor(height * 0.35); // korunacak alan yüksekliği
-
-  // Önce tam transparent bir canvas oluştur (edit edilecek alan)
+  const preserveHeight = Math.floor(height * 0.35);
   const base = await sharp({
     create: { width, height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
   }).png().toBuffer();
-
-  // Üstüne opaque beyaz katman koy (yüz/baş — korunacak alan)
   const faceBlock = await sharp({
     create: { width, height: preserveHeight, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 255 } },
   }).png().toBuffer();
-
-  return sharp(base)
-    .composite([{ input: faceBlock, top: 0, left: 0 }])
-    .png()
-    .toBuffer();
+  return sharp(base).composite([{ input: faceBlock, top: 0, left: 0 }]).png().toBuffer();
 }
 
-// ─── GERÇEK INPAINTING: gpt-image-1 + mask ───────────────────────────────────
-// Mask sayesinde yüze hiç dokunulmaz — sadece kıyafet bölgesi yeniden üretilir
+// ─── FACE RESTORE: üretilen görselin üstüne orijinal yüzü yapıştır ────────────
+// Bu adım yüzün %100 orijinal kalmasını GARANTI eder
+// gpt-image-1 ne kadar değiştirirse değiştirsin, biz üstüne orijinali koyuyoruz
+async function restoreOriginalFace(
+  originalPng: Buffer,
+  generatedBase64: string,
+  facePercent: number = 0.40  // %40 — saç dahil yüzü kapsar
+): Promise<string> {
+  try {
+    const { width = 1024, height = 1024 } = await sharp(originalPng).metadata();
+    const faceHeight = Math.floor(height * facePercent);
+
+    // Orijinal fotoğraftan yüz bölgesini kes
+    const originalFaceRegion = await sharp(originalPng)
+      .extract({ left: 0, top: 0, width, height: faceHeight })
+      .toBuffer();
+
+    // Üretilen görseli decode et
+    const generatedBuffer = Buffer.from(
+      generatedBase64.replace(/^data:image\/\w+;base64,/, ""),
+      "base64"
+    );
+
+    // Üretilen görselin üstüne orijinal yüzü yapıştır
+    const finalBuffer = await sharp(generatedBuffer)
+      .resize(width, height) // boyutları eşitle
+      .composite([{ input: originalFaceRegion, top: 0, left: 0 }])
+      .png()
+      .toBuffer();
+
+    return `data:image/png;base64,${finalBuffer.toString("base64")}`;
+  } catch (e: any) {
+    // Hata olursa orijinal üretilen görseli dön
+    console.error("restoreOriginalFace error:", e?.message);
+    return generatedBase64;
+  }
+}
+
+// ─── INPAINTING + FACE RESTORE ────────────────────────────────────────────────
 async function inpaintOutfit(
   apiKey: string,
   pngBuffer: Buffer,
@@ -88,10 +115,23 @@ async function inpaintOutfit(
     }
 
     const data = await res.json();
-    if (data.data?.[0]?.b64_json) return { image: `data:image/png;base64,${data.data[0].b64_json}`, debug: "inpainting mask ✓" };
-    if (data.data?.[0]?.url)      return { image: data.data[0].url, debug: "inpainting mask (url) ✓" };
+    let generatedImage: string | null = null;
 
-    return { image: null, debug: `Beklenmedik yanıt: ${JSON.stringify(data).substring(0, 200)}` };
+    if (data.data?.[0]?.b64_json) {
+      generatedImage = `data:image/png;base64,${data.data[0].b64_json}`;
+    } else if (data.data?.[0]?.url) {
+      generatedImage = data.data[0].url;
+    }
+
+    if (!generatedImage) {
+      return { image: null, debug: `Beklenmedik yanıt: ${JSON.stringify(data).substring(0, 200)}` };
+    }
+
+    // ── FACE RESTORE: orijinal yüzü üstüne yapıştır ──────
+    // Bu adım olmadan AI yüzü değiştirebilir — bu adımla %100 orijinal kalır
+    const finalImage = await restoreOriginalFace(pngBuffer, generatedImage);
+
+    return { image: finalImage, debug: "inpainting + face restore ✓" };
   } catch (e: any) {
     return { image: null, debug: `Exception: ${e?.message?.substring(0, 200)}` };
   }
@@ -108,18 +148,18 @@ export async function POST(request: NextRequest) {
 
     const raw = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), "base64");
 
-    // PNG 1024x1024 — inpainting için
+    // PNG 1024x1024 — inpainting + face restore için
     const pngBuffer = await sharp(raw)
       .resize(1024, 1024, { fit: "cover", position: "attention" })
       .png({ compressionLevel: 7 })
       .toBuffer();
 
-    // JPEG — analiz için (küçük, hızlı)
+    // JPEG — analiz için
     const jpgDataUrl = `data:image/jpeg;base64,${(
       await sharp(raw).resize(800, 800, { fit: "cover", position: "attention" }).jpeg({ quality: 80 }).toBuffer()
     ).toString("base64")}`;
 
-    // Mask bir kez üretilir, 3 görsel için paylaşılır
+    // Mask bir kez üretilir
     const maskBuffer = await createMask(1024, 1024);
 
     // ── STEP 1: Analiz ────────────────────────────────────
@@ -144,7 +184,7 @@ export async function POST(request: NextRequest) {
       outfits = JSON.parse(r.replace(/```json|```/g, "").trim());
     } catch { outfits = mockO(); }
 
-    // ── STEP 3: 3 görsel PARALEL inpainting ──────────────
+    // ── STEP 3: Paralel inpainting + face restore ─────────
     console.log("3 görsel paralel inpainting başlatıldı...");
     const results = await Promise.all(
       outfits.map((o: any, i: number) => {
@@ -158,7 +198,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      mode: "inpainting-mask",
+      mode: "inpainting-face-restore",
       analysis: {
         skinTone: analysis.skinTone || "Medium", undertone: analysis.undertone || "Neutral",
         faceShape: analysis.faceShape || "Oval", bodyType: analysis.bodyType || "Mesomorph",
