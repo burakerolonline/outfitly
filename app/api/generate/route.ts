@@ -2,19 +2,23 @@ import { NextRequest, NextResponse } from "next/server";
 import sharp from "sharp";
 
 // ═══════════════════════════════════════════════════════
-// MASK-BASED INPAINTING
+// MASK-BASED INPAINTING — FIXED VERSION
 //
-// 1. GPT-4o Vision → analiz + yüz pozisyonu tespit
-// 2. sharp → mask oluştur (yüz=korunan, gövde=düzenlenecek)
-// 3. images.edit + mask → SADECE kıyafet alanı düzenlenir
-//    Yüz pikselleri HİÇ değişmez.
+// Önceki sorunlar:
+// 1. Yüz orijinal fotoğrafta tespit ediliyordu ama mask
+//    kare (1024x1024) görsele uygulanıyordu → koordinat hatası
+// 2. Mask yeterince geniş değildi
+//
+// Düzeltmeler:
+// 1. Önce 1024x1024'e resize → sonra yüz tespit
+// 2. Yüz bölgesi çok geniş tutuldu (boyun dahil)
+// 3. Yüz üstü her şey de korunuyor (saç, kafa)
 // ═══════════════════════════════════════════════════════
 
 export const maxDuration = 120;
 
 const OPENAI = "https://api.openai.com/v1";
 
-// ─── GPT-4o text çağrısı ───
 async function gptText(apiKey: string, messages: any[]): Promise<string> {
   const res = await fetch(`${OPENAI}/chat/completions`, {
     method: "POST",
@@ -26,68 +30,61 @@ async function gptText(apiKey: string, messages: any[]): Promise<string> {
   return data.choices?.[0]?.message?.content || "";
 }
 
-// ─── Yüz pozisyonunu tespit et ───
-async function detectFaceRegion(apiKey: string, imageDataUrl: string): Promise<{ topPercent: number; bottomPercent: number; leftPercent: number; rightPercent: number }> {
+// ─── Yüzün alt sınırını tespit et (% olarak) ───
+async function detectFaceBottom(apiKey: string, resizedBase64: string): Promise<number> {
   try {
+    const dataUrl = `data:image/png;base64,${resizedBase64}`;
     const raw = await gptText(apiKey, [{
       role: "user",
       content: [
         {
           type: "text",
-          text: `Look at this photo and find the person's HEAD (including hair, forehead to chin). 
-Give me the bounding box as percentages of the image dimensions.
-Respond ONLY with JSON, no markdown:
-{"topPercent": number, "bottomPercent": number, "leftPercent": number, "rightPercent": number}
-Where 0=top/left edge, 100=bottom/right edge.
-Include some margin around the head (add ~5% padding on each side).`,
+          text: `This is a 1024x1024 square image. Find where the person's CHIN ends (the bottom of their face/jaw, NOT including neck or body).
+
+Express this as a percentage from the top of the image. For example, if the chin is at pixel 400 out of 1024, that's about 39%.
+
+Respond with ONLY a single number (the percentage), nothing else. Example: 42`,
         },
-        { type: "image_url", image_url: { url: imageDataUrl } },
+        { type: "image_url", image_url: { url: dataUrl } },
       ],
     }]);
-    const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
-    console.log("Face region:", JSON.stringify(parsed));
-    return parsed;
+
+    const percent = parseInt(raw.trim(), 10);
+    if (isNaN(percent) || percent < 10 || percent > 80) {
+      console.log(`Face detection returned invalid value: "${raw}", using default 40%`);
+      return 40;
+    }
+    console.log(`Face bottom detected at: ${percent}%`);
+    return percent;
   } catch (err) {
-    console.error("Face detection failed, using default:", err);
-    // Default: face is roughly in the top 40% of image
-    return { topPercent: 0, bottomPercent: 40, leftPercent: 15, rightPercent: 85 };
+    console.error("Face detection failed:", err);
+    return 40; // Default: face ends at 40%
   }
 }
 
-// ─── Mask oluştur: yüz=opaque(korunan), gövde=transparent(düzenlenecek) ───
-async function createMask(
-  width: number,
-  height: number,
-  faceRegion: { topPercent: number; bottomPercent: number; leftPercent: number; rightPercent: number }
-): Promise<Buffer> {
-  // Yüz bölgesi koordinatları (piksel)
-  const faceTop = Math.max(0, Math.floor((faceRegion.topPercent / 100) * height));
-  const faceBottom = Math.min(height, Math.floor((faceRegion.bottomPercent / 100) * height));
-  const faceLeft = Math.max(0, Math.floor((faceRegion.leftPercent / 100) * width));
-  const faceRight = Math.min(width, Math.floor((faceRegion.rightPercent / 100) * width));
+// ─── Mask oluştur ───
+// Basit yatay bölme: üst kısım = korunan (yüz+saç+kafa), alt kısım = düzenlenecek (gövde+kıyafet)
+// OpenAI mask formatı: transparent (alpha=0) = düzenle, opaque (alpha=255) = koru
+async function createSimpleMask(size: number, protectTopPercent: number): Promise<Buffer> {
+  const splitY = Math.floor((protectTopPercent / 100) * size);
 
-  console.log(`Mask: ${width}x${height}, face protected: y=${faceTop}-${faceBottom}, x=${faceLeft}-${faceRight}`);
+  console.log(`Mask: top ${protectTopPercent}% protected (0-${splitY}px), bottom ${100 - protectTopPercent}% editable (${splitY}-${size}px)`);
 
-  // RGBA buffer oluştur
   const channels = 4;
-  const buffer = Buffer.alloc(width * height * channels);
+  const buffer = Buffer.alloc(size * size * channels);
 
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const idx = (y * width + x) * channels;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const idx = (y * size + x) * channels;
 
-      const inFaceRegion =
-        y >= faceTop && y <= faceBottom &&
-        x >= faceLeft && x <= faceRight;
-
-      if (inFaceRegion) {
-        // YÜZ BÖLGESİ → opaque (alpha=255) → KORUNAN, düzenlenmez
-        buffer[idx] = 255;     // R
-        buffer[idx + 1] = 255; // G
-        buffer[idx + 2] = 255; // B
+      if (y < splitY) {
+        // ÜST KISIM (yüz, saç, kafa) → opaque → KORU
+        buffer[idx] = 0;       // R
+        buffer[idx + 1] = 0;   // G
+        buffer[idx + 2] = 0;   // B
         buffer[idx + 3] = 255; // A = opaque = KEEP
       } else {
-        // GÖVDe/KIYAFET → transparent (alpha=0) → DÜZENLENECEK
+        // ALT KISIM (gövde, kıyafet) → transparent → DÜZENLE
         buffer[idx] = 0;       // R
         buffer[idx + 1] = 0;   // G
         buffer[idx + 2] = 0;   // B
@@ -96,29 +93,16 @@ async function createMask(
     }
   }
 
-  // PNG olarak encode et
-  const maskPng = await sharp(buffer, { raw: { width, height, channels } })
+  return sharp(buffer, { raw: { width: size, height: size, channels } })
     .png()
     .toBuffer();
-
-  console.log(`Mask created: ${maskPng.length} bytes`);
-  return maskPng;
 }
 
-// ─── images.edit + mask ile inpainting ───
-async function inpaintOutfit(
-  apiKey: string,
-  imagePngBuffer: Buffer,
-  maskPngBuffer: Buffer,
-  prompt: string
-): Promise<string | null> {
+// ─── Inpainting ───
+async function inpaint(apiKey: string, imagePng: Buffer, maskPng: Buffer, prompt: string): Promise<string | null> {
   const formData = new FormData();
-
-  const imageBlob = new Blob([new Uint8Array(imagePngBuffer)], { type: "image/png" });
-  const maskBlob = new Blob([new Uint8Array(maskPngBuffer)], { type: "image/png" });
-
-  formData.append("image", imageBlob, "photo.png");
-  formData.append("mask", maskBlob, "mask.png");
+  formData.append("image", new Blob([new Uint8Array(imagePng)], { type: "image/png" }), "photo.png");
+  formData.append("mask", new Blob([new Uint8Array(maskPng)], { type: "image/png" }), "mask.png");
   formData.append("model", "gpt-image-1");
   formData.append("prompt", prompt);
   formData.append("n", "1");
@@ -130,19 +114,18 @@ async function inpaintOutfit(
     body: formData,
   });
 
+  console.log(`    images.edit status: ${res.status}`);
+
   if (!res.ok) {
-    const errText = await res.text();
-    console.error(`images.edit error ${res.status}: ${errText.substring(0, 500)}`);
+    const err = await res.text();
+    console.error(`    images.edit error: ${err.substring(0, 400)}`);
     return null;
   }
 
   const data = await res.json();
-  if (data.data?.[0]?.b64_json) {
-    return `data:image/png;base64,${data.data[0].b64_json}`;
-  }
-  if (data.data?.[0]?.url) {
-    return data.data[0].url;
-  }
+  if (data.data?.[0]?.b64_json) return `data:image/png;base64,${data.data[0].b64_json}`;
+  if (data.data?.[0]?.url) return data.data[0].url;
+  console.log("    No image in response");
   return null;
 }
 
@@ -163,29 +146,32 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: true, mode: "mock", analysis: getMockAnalysis(), outfits: getMockOutfits() });
     }
 
-    const imageDataUrl = imageBase64.startsWith("data:")
-      ? imageBase64
-      : `data:image/jpeg;base64,${imageBase64}`;
-
-    // ─── Görseli 1024x1024 PNG'ye dönüştür ───
-    console.log("Preparing image...");
+    // ═══ Görseli 1024x1024 PNG'ye dönüştür ═══
+    console.log("=== PREPARING IMAGE ===");
     const base64Clean = imageBase64.replace(/^data:image\/\w+;base64,/, "");
     const inputBuffer = Buffer.from(base64Clean, "base64");
 
-    const resizedImage = await sharp(inputBuffer)
-      .resize(1024, 1024, { fit: "cover", position: "center" })
+    const resizedPng = await sharp(inputBuffer)
+      .resize(1024, 1024, { fit: "cover", position: "attention" }) // "attention" = akıllı crop, yüzü ortalama
       .png()
       .toBuffer();
 
-    console.log(`Image resized to 1024x1024 (${resizedImage.length} bytes)`);
+    const resizedBase64 = resizedPng.toString("base64");
+    const resizedDataUrl = `data:image/png;base64,${resizedBase64}`;
+    console.log(`Image: ${resizedPng.length} bytes (1024x1024)`);
 
-    // ═══ STEP 1: Yüz pozisyonunu tespit et ═══
-    console.log("=== STEP 1: Detecting face ===");
-    const faceRegion = await detectFaceRegion(apiKey, imageDataUrl);
+    // ═══ STEP 1: RESIZE EDİLMİŞ görselde yüz tespit ═══
+    console.log("=== STEP 1: Face detection on RESIZED image ===");
+    const faceBottomPercent = await detectFaceBottom(apiKey, resizedBase64);
+
+    // Yüz altına %10 ekstra padding ekle (boyun dahil)
+    const protectPercent = Math.min(faceBottomPercent + 10, 70);
+    console.log(`Protecting top ${protectPercent}% of image`);
 
     // ═══ STEP 2: Mask oluştur ═══
     console.log("=== STEP 2: Creating mask ===");
-    const maskBuffer = await createMask(1024, 1024, faceRegion);
+    const maskPng = await createSimpleMask(1024, protectPercent);
+    console.log(`Mask: ${maskPng.length} bytes`);
 
     // ═══ STEP 3: Kişiyi analiz et ═══
     console.log("=== STEP 3: Analyzing person ===");
@@ -194,12 +180,12 @@ export async function POST(request: NextRequest) {
       const raw = await gptText(apiKey, [{
         role: "user",
         content: [
-          { type: "text", text: 'Analyze for fashion. ONLY JSON:\n{"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"25-30","confidence":95}' },
-          { type: "image_url", image_url: { url: imageDataUrl } },
+          { type: "text", text: 'Fashion analysis. ONLY JSON:\n{"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"25-30","confidence":95}' },
+          { type: "image_url", image_url: { url: resizedDataUrl } },
         ],
       }]);
       analysis = JSON.parse(raw.replace(/```json|```/g, "").trim());
-      console.log("Analysis:", JSON.stringify(analysis));
+      console.log(`Analysis: ${analysis.gender}, ${analysis.skinTone}, ${analysis.hairColor}`);
     } catch (err) {
       console.error("Analysis failed:", err);
       analysis = getMockAnalysis();
@@ -220,39 +206,34 @@ export async function POST(request: NextRequest) {
         content: `World-class stylist. PERSON: ${analysis.gender}, ~${analysis.age}, ${analysis.skinTone} skin (${analysis.undertone}), ${analysis.hairColor} hair, ${analysis.bodyType}.\nSTYLE: ${styleLabels[style] || style}\n${productUrl ? "INCLUDE: " + productUrl : ""}\n\n3 outfits. ONLY JSON:\n[{"name":"Safe Stylish","description":"...","top":"garment fabric color #hex","bottom":"garment fabric color #hex","shoes":"shoe material color","accessories":["item1","item2"],"colors":["#hex1","#hex2","#hex3"],"occasion":"..."},{"name":"Trendy Bold",...},{"name":"Premium Luxury",...}]`,
       }]);
       outfits = JSON.parse(raw.replace(/```json|```/g, "").trim());
-      console.log("Outfits:", outfits.map((o: any) => o.name).join(", "));
+      console.log(`Outfits: ${outfits.map((o: any) => o.name).join(", ")}`);
     } catch (err) {
       console.error("Outfits failed:", err);
       outfits = getMockOutfits();
     }
 
-    // ═══ STEP 5: Mask ile inpainting — sadece kıyafet değişir ═══
-    console.log("=== STEP 5: Inpainting with mask ===");
+    // ═══ STEP 5: Mask ile inpainting ═══
+    console.log("=== STEP 5: Inpainting (mask-based) ===");
 
     const editResults: (string | null)[] = [];
 
     for (let i = 0; i < outfits.length; i++) {
       const outfit = outfits[i];
-      console.log(`  Outfit ${i + 1}/3: ${outfit.name}...`);
+      console.log(`  Outfit ${i + 1}/3: ${outfit.name}`);
 
-      const prompt = `Edit ONLY the clothing area of this photo (the masked/transparent region). The face and head area is protected and must not be touched at all.
+      const prompt = `Fill the transparent area of the mask with new clothing on the existing person. The top part of the image (face, hair, head) is protected and already preserved.
 
-Replace the visible clothing with:
-- Top/shirt: ${outfit.top}
-- Pants/bottom: ${outfit.bottom}
+In the editable area, dress the person in:
+- Top: ${outfit.top}
+- Bottom: ${outfit.bottom}  
 - Shoes: ${outfit.shoes}
-- Add accessories: ${outfit.accessories?.join(", ") || "none"}
+- Accessories: ${outfit.accessories?.join(", ") || "none"}
 
-Keep the person's exact body shape and pose. The new clothes must fit naturally with realistic fabric, folds, and shadows matching the existing lighting. The result must look like a real photograph.`;
+The clothing must seamlessly blend with the protected area above. Match the person's body shape, the existing lighting, and the photo's perspective. The result must look like a natural, unedited photograph.`;
 
-      try {
-        const result = await inpaintOutfit(apiKey, resizedImage, maskBuffer, prompt);
-        editResults.push(result);
-        console.log(`  ${result ? "✅" : "❌"} Outfit ${i + 1}/3`);
-      } catch (err: any) {
-        console.error(`  ❌ Outfit ${i + 1}/3 error:`, err?.message);
-        editResults.push(null);
-      }
+      const result = await inpaint(apiKey, resizedPng, maskPng, prompt);
+      editResults.push(result);
+      console.log(`  ${result ? "✅" : "❌"} Outfit ${i + 1}/3`);
     }
 
     const finalOutfits = outfits.map((o: any, i: number) => ({
@@ -267,7 +248,7 @@ Keep the person's exact body shape and pose. The new clothes must fit naturally 
       generatedImage: editResults[i] || null,
     }));
 
-    console.log(`=== DONE === Images: ${editResults.filter(Boolean).length}/3`);
+    console.log(`=== DONE === Mode: mask-inpainting, Images: ${editResults.filter(Boolean).length}/3`);
 
     return NextResponse.json({
       success: true,
