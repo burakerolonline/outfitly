@@ -1,23 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI, { toFile } from "openai";
 
-// ═══════════════════════════════════════════════════════
-// AI OUTFIT GENERATOR — Same method as ChatGPT
-//
-//   1. GPT-4o Vision  → analyze your photo
-//   2. GPT-4o         → recommend outfits
-//   3. gpt-image-1    → edit YOUR photo (keeps face, changes clothes)
-//
-// Only needs: OPENAI_API_KEY
-// ═══════════════════════════════════════════════════════
-
 function getClient(): OpenAI | null {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
   return new OpenAI({ apiKey });
 }
 
-export const maxDuration = 120; // Allow up to 2 min for image generation
+export const maxDuration = 120;
 
 export async function POST(request: NextRequest) {
   try {
@@ -45,7 +35,7 @@ export async function POST(request: NextRequest) {
     // ═══════════════════════════════════════════════
     // STEP 1: GPT-4o Vision → Analyze Photo
     // ═══════════════════════════════════════════════
-    console.log("🔍 Step 1: Analyzing photo...");
+    console.log("Step 1: Analyzing photo...");
 
     let analysis;
     try {
@@ -59,7 +49,7 @@ export async function POST(request: NextRequest) {
             content: [
               {
                 type: "text",
-                text: `Analyze this person for fashion styling. Respond ONLY valid JSON, no markdown:\n{"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"...","distinctFeatures":"glasses, beard, etc or none","confidence":95}`,
+                text: 'Analyze this person for fashion styling. Respond ONLY valid JSON, no markdown:\n{"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"...","distinctFeatures":"glasses, beard, etc or none","confidence":95}',
               },
               {
                 type: "image_url",
@@ -80,7 +70,7 @@ export async function POST(request: NextRequest) {
     // ═══════════════════════════════════════════════
     // STEP 2: GPT-4o → Outfit Recommendations
     // ═══════════════════════════════════════════════
-    console.log("👔 Step 2: Generating outfit ideas...");
+    console.log("Step 2: Generating outfit ideas...");
 
     const styleLabels: Record<string, string> = {
       "old-money": "Old Money / Quiet Luxury",
@@ -100,7 +90,27 @@ export async function POST(request: NextRequest) {
         messages: [
           {
             role: "user",
-            content: `You are a world-class stylist.\n\nPERSON: ${analysis.gender}, ~${analysis.age}, ${analysis.skinTone} skin (${analysis.undertone} undertone), ${analysis.hairColor} hair, ${analysis.bodyType}. ${analysis.distinctFeatures || ""}\nSTYLE: ${styleLabels[style] || style}\n${productUrl ? `MUST INCLUDE: ${productUrl}` : ""}\n\nGenerate 3 outfits. Respond ONLY with a JSON array, no markdown:\n[\n  {\n    "name": "Safe Stylish",\n    "description": "one line description",\n    "top": "garment, fabric, color + hex",\n    "bottom": "garment, fabric, color + hex",\n    "shoes": "shoe, material, color",\n    "accessories": ["item1", "item2", "item3"],\n    "colors": ["#hex1", "#hex2", "#hex3"],\n    "occasion": "where to wear"\n  },\n  { "name": "Trendy Bold", ... },\n  { "name": "Premium Luxury", ... }\n]`,
+            content: `You are a world-class stylist.
+
+PERSON: ${analysis.gender}, ~${analysis.age}, ${analysis.skinTone} skin (${analysis.undertone} undertone), ${analysis.hairColor} hair, ${analysis.bodyType}. ${analysis.distinctFeatures || ""}
+STYLE: ${styleLabels[style] || style}
+${productUrl ? "MUST INCLUDE: " + productUrl : ""}
+
+Generate 3 outfits. Respond ONLY with a JSON array, no markdown:
+[
+  {
+    "name": "Safe Stylish",
+    "description": "one line description",
+    "top": "garment, fabric, color + hex",
+    "bottom": "garment, fabric, color + hex",
+    "shoes": "shoe, material, color",
+    "accessories": ["item1", "item2", "item3"],
+    "colors": ["#hex1", "#hex2", "#hex3"],
+    "occasion": "where to wear"
+  },
+  { "name": "Trendy Bold", ... },
+  { "name": "Premium Luxury", ... }
+]`,
           },
         ],
       });
@@ -114,12 +124,9 @@ export async function POST(request: NextRequest) {
 
     // ═══════════════════════════════════════════════
     // STEP 3: gpt-image-1 → Edit YOUR photo
-    // Same method as ChatGPT — keeps face, changes clothes
-    // Uses OpenAI SDK which handles encoding properly
     // ═══════════════════════════════════════════════
-    console.log("🎨 Step 3: Editing your photo with outfits...");
+    console.log("Step 3: Editing your photo with outfits...");
 
-    // Convert base64 to a file the SDK can handle
     const base64Clean = imageBase64.replace(/^data:image\/\w+;base64,/, "");
     const imageBuffer = Buffer.from(base64Clean, "base64");
     const imageFile = await toFile(imageBuffer, "photo.png", {
@@ -129,18 +136,28 @@ export async function POST(request: NextRequest) {
     const editResults = await Promise.all(
       outfits.map(async (outfit: any, i: number) => {
         try {
-          const editPrompt = `Edit this photo of a real person. Keep their EXACT same face, hair, skin tone, pose, and background completely unchanged. ONLY replace their clothing with this new outfit:
+          const editPrompt = `You are editing a real photograph of a person. This is a strict photo edit, not an artistic creation.
 
-Top: ${outfit.top}
-Bottom: ${outfit.bottom}
-Shoes: ${outfit.shoes}
-Accessories: ${outfit.accessories?.join(", ") || "none"}
+ABSOLUTE RULES — NEVER VIOLATE:
+- The person's face must remain IDENTICAL: same eyes, nose, mouth, jawline, eyebrows, facial hair, expression. Not similar — IDENTICAL.
+- Their hairstyle, hair color, and head must remain completely untouched.
+- Their skin tone, body shape, weight, and proportions stay exactly the same.
+- Their pose, stance, arm positions, hand positions remain frozen as-is.
+- Any objects they hold (phone, bag, keys) remain exactly where they are.
+- The background, environment, lighting, shadows, and camera angle are LOCKED — zero changes.
 
-The result must look like a natural, real photograph. The person's identity must remain exactly the same. Only the clothing changes.`;
+WHAT TO CHANGE — CLOTHING ONLY:
+- Remove their current top/shirt and replace with: ${outfit.top}
+- Remove their current pants/bottom and replace with: ${outfit.bottom}
+- Replace their footwear with: ${outfit.shoes}
+
+ACCESSORIES TO ADD (place naturally on the person):
+${outfit.accessories?.map((a: string) => "- " + a).join("\n") || "- None"}
+
+The new clothes must wrap around the person's exact body shape realistically. Fabric folds, shadows, and fit must match the pose. The final image must be indistinguishable from a real photograph.`;
 
           console.log(`  Editing outfit ${i + 1}/3: ${outfit.name}...`);
 
-          // Use OpenAI SDK — handles all encoding correctly
           const response = await client.images.edit({
             model: "gpt-image-1",
             image: imageFile,
@@ -149,27 +166,24 @@ The result must look like a natural, real photograph. The person's identity must
             size: "1024x1024",
           });
 
-          // Get the result — SDK returns b64_json or url
           const result = response.data?.[0];
           if (result?.b64_json) {
-            console.log(`  ✅ Outfit ${i + 1} done (base64)`);
+            console.log(`  Done ${i + 1}/3`);
             return `data:image/png;base64,${result.b64_json}`;
           }
           if (result?.url) {
-            console.log(`  ✅ Outfit ${i + 1} done (url)`);
+            console.log(`  Done ${i + 1}/3`);
             return result.url;
           }
 
-          console.log(`  ⚠️ Outfit ${i + 1} no image returned`);
           return null;
         } catch (err: any) {
-          console.error(`  ❌ Outfit ${i + 1} failed:`, err?.message || err);
+          console.error(`  Failed ${i + 1}/3:`, err?.message || err);
           return null;
         }
       })
     );
 
-    // Build final response
     const finalOutfits = outfits.map((o: any, i: number) => ({
       name: o.name || ["Safe Stylish", "Trendy Bold", "Premium Luxury"][i],
       description: o.description || "",
@@ -182,7 +196,7 @@ The result must look like a natural, real photograph. The person's identity must
       generatedImage: editResults[i] || null,
     }));
 
-    console.log("✅ All done!");
+    console.log("All done!");
 
     return NextResponse.json({
       success: true,
@@ -199,7 +213,7 @@ The result must look like a natural, real photograph. The person's identity must
       outfits: finalOutfits,
     });
   } catch (error: any) {
-    console.error("❌ Error:", error?.message || error);
+    console.error("Error:", error?.message || error);
     return NextResponse.json(
       { error: error?.message || "Generation failed" },
       { status: 500 }
@@ -207,7 +221,6 @@ The result must look like a natural, real photograph. The person's identity must
   }
 }
 
-// ─── Mock data (when no API key) ─────────────────────
 function getMockAnalysis() {
   return {
     skinTone: "Medium",
