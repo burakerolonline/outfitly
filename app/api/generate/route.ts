@@ -2,8 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import OpenAI, { toFile } from "openai";
 
 // ═══════════════════════════════════════════════════════
-// gpt-4o      → analiz + kıyafet önerisi (text)
-// gpt-image-1 → fotoğraf düzenleme (ChatGPT'nin aynı motoru)
+// Yöntem 1 (öncelikli): Responses API + image_generation
+//   → ChatGPT'nin yöntemi, yüzü en iyi koruyan
+// Yöntem 2 (yedek): images.edit + gpt-image-1
+//   → Çalıştığı kanıtlanmış, yüz koruması daha zayıf
 // ═══════════════════════════════════════════════════════
 
 export const maxDuration = 120;
@@ -14,6 +16,125 @@ function getClient(): OpenAI | null {
   return new OpenAI({ apiKey });
 }
 
+// ─── Yöntem 1: Responses API (ChatGPT'nin kullandığı) ───
+async function editWithResponsesAPI(
+  client: OpenAI,
+  imageDataUrl: string,
+  prompt: string
+): Promise<string | null> {
+  try {
+    // @ts-ignore - responses API may not be in older type definitions
+    const response = await client.responses.create({
+      model: "gpt-4o",
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_image", image_url: imageDataUrl },
+            { type: "input_text", text: prompt },
+          ],
+        },
+      ],
+      tools: [{ type: "image_generation", quality: "high", size: "1024x1024" }],
+    });
+
+    // Response'dan image'ı çıkar
+    const output = response?.output;
+    if (!output || !Array.isArray(output)) {
+      console.log("  Responses API: no output array");
+      return null;
+    }
+
+    for (const block of output) {
+      // Direkt image_generation_call bloğu
+      if (block.type === "image_generation_call" && block.result) {
+        console.log("  Responses API: found image_generation_call");
+        return `data:image/png;base64,${block.result}`;
+      }
+      // Message içinde nested
+      if (block.type === "message" && block.content) {
+        for (const content of block.content) {
+          if (content.type === "image" && content.image_url) {
+            console.log("  Responses API: found image in message");
+            return content.image_url;
+          }
+          if (content.type === "image_generation_call" && content.result) {
+            console.log("  Responses API: found image_generation_call in message");
+            return `data:image/png;base64,${content.result}`;
+          }
+        }
+      }
+    }
+
+    console.log("  Responses API: image not found in output. Keys:", JSON.stringify(output.map((b: any) => b.type)));
+    return null;
+  } catch (err: any) {
+    console.error("  Responses API error:", err?.message?.substring(0, 300) || err);
+    return null;
+  }
+}
+
+// ─── Yöntem 2: images.edit (yedek) ───
+async function editWithImagesAPI(
+  client: OpenAI,
+  imageFile: any,
+  prompt: string
+): Promise<string | null> {
+  try {
+    const response = await client.images.edit({
+      model: "gpt-image-1",
+      image: imageFile,
+      prompt: prompt,
+      n: 1,
+      size: "1024x1024",
+    });
+
+    const result = response.data?.[0];
+    if (result?.b64_json) return `data:image/png;base64,${result.b64_json}`;
+    if (result?.url) return result.url;
+    return null;
+  } catch (err: any) {
+    console.error("  Images API error:", err?.message?.substring(0, 300) || err);
+    return null;
+  }
+}
+
+// ─── Yüz koruma prompt'u oluştur ───
+function buildEditPrompt(outfit: any, analysis: any): string {
+  return `CRITICAL: FACE & IDENTITY PRESERVATION
+
+You are editing a real photograph. The person in this photo has these EXACT features that MUST NOT change:
+- Gender: ${analysis.gender}
+- Age: approximately ${analysis.age}
+- Skin tone: ${analysis.skinTone} with ${analysis.undertone} undertone
+- Hair: ${analysis.hairColor}
+- Face shape: ${analysis.faceShape}
+- Body type: ${analysis.bodyType}
+
+ABSOLUTE RULES:
+- Every pixel of their face must remain IDENTICAL: eyes, nose, mouth, jawline, eyebrows, facial hair, skin texture, moles, freckles — everything.
+- Hair style, color, volume, hairline — IDENTICAL.
+- Body shape, proportions, weight, muscle definition — IDENTICAL.
+- Pose, posture, arm angles, hand positions, finger placement — IDENTICAL.
+- Objects they hold (phone, bag) — keep exactly as they are.
+- Background, environment, lighting, shadows, reflections — IDENTICAL.
+
+ONLY CHANGE CLOTHING:
+- Top: ${outfit.top}
+- Bottom: ${outfit.bottom}
+- Shoes: ${outfit.shoes}
+
+ADD THESE ACCESSORIES:
+${outfit.accessories?.map((a: string) => "- " + a).join("\n") || "- None"}
+
+The clothing must wrap naturally around their body with realistic fabric physics. The result must be indistinguishable from the original photo — as if the person was actually wearing these clothes.
+
+If the face changes even 1%, the output is a FAILURE. Identity preservation is the #1 priority.`;
+}
+
+// ═══════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -32,11 +153,8 @@ export async function POST(request: NextRequest) {
       ? imageBase64
       : `data:image/jpeg;base64,${imageBase64}`;
 
-    // ═══════════════════════════════════════════════
-    // STEP 1: gpt-4o → Analyze photo
-    // ═══════════════════════════════════════════════
+    // ═══ STEP 1: Analyze ═══
     console.log("Step 1: Analyzing...");
-
     let analysis;
     try {
       const res = await client.chat.completions.create({
@@ -46,23 +164,19 @@ export async function POST(request: NextRequest) {
         messages: [{
           role: "user",
           content: [
-            { type: "text", text: 'Analyze this person for fashion styling. Respond ONLY valid JSON:\n{"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"...","confidence":95}' },
+            { type: "text", text: 'Analyze this person for fashion styling. Respond ONLY valid JSON:\n{"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"25-30","confidence":95}' },
             { type: "image_url", image_url: { url: imageDataUrl } },
           ],
         }],
       });
-      const raw = res.choices[0]?.message?.content || "";
-      analysis = JSON.parse(raw.replace(/```json|```/g, "").trim());
+      analysis = JSON.parse((res.choices[0]?.message?.content || "").replace(/```json|```/g, "").trim());
     } catch (err) {
       console.error("Analysis error:", err);
       analysis = getMockAnalysis();
     }
 
-    // ═══════════════════════════════════════════════
-    // STEP 2: gpt-4o → Outfit suggestions
-    // ═══════════════════════════════════════════════
+    // ═══ STEP 2: Outfits ═══
     console.log("Step 2: Outfits...");
-
     const styleLabels: Record<string, string> = {
       "old-money": "Old Money / Quiet Luxury",
       streetwear: "Streetwear / Urban",
@@ -83,79 +197,54 @@ export async function POST(request: NextRequest) {
           content: `World-class stylist. PERSON: ${analysis.gender}, ~${analysis.age}, ${analysis.skinTone} skin (${analysis.undertone}), ${analysis.hairColor} hair, ${analysis.bodyType}.\nSTYLE: ${styleLabels[style] || style}\n${productUrl ? "INCLUDE: " + productUrl : ""}\n\n3 outfits. ONLY JSON array:\n[{"name":"Safe Stylish","description":"...","top":"garment fabric color #hex","bottom":"garment fabric color #hex","shoes":"shoe material color","accessories":["item1","item2"],"colors":["#hex1","#hex2","#hex3"],"occasion":"..."},{"name":"Trendy Bold",...},{"name":"Premium Luxury",...}]`,
         }],
       });
-      const raw = res.choices[0]?.message?.content || "";
-      outfits = JSON.parse(raw.replace(/```json|```/g, "").trim());
+      outfits = JSON.parse((res.choices[0]?.message?.content || "").replace(/```json|```/g, "").trim());
     } catch (err) {
       console.error("Outfits error:", err);
       outfits = getMockOutfits();
     }
 
-    // ═══════════════════════════════════════════════
-    // STEP 3: gpt-image-1 → Edit YOUR photo
-    // ═══════════════════════════════════════════════
+    // ═══ STEP 3: Edit photos ═══
     console.log("Step 3: Editing photos...");
 
+    // images.edit için dosya hazırla
     const base64Clean = imageBase64.replace(/^data:image\/\w+;base64,/, "");
     const imageBuffer = Buffer.from(base64Clean, "base64");
     const imageFile = await toFile(imageBuffer, "photo.png", { type: "image/png" });
 
-    const editResults = await Promise.all(
-      outfits.map(async (outfit: any, i: number) => {
-        try {
-          console.log(`  Outfit ${i + 1}/3: ${outfit.name}...`);
+    // Önce Responses API'yi test et (ilk outfit ile)
+    console.log("  Testing Responses API...");
+    const testPrompt = buildEditPrompt(outfits[0], analysis);
+    const testResult = await editWithResponsesAPI(client, imageDataUrl, testPrompt);
+    const useResponsesAPI = testResult !== null;
+    console.log(`  Responses API ${useResponsesAPI ? "✅ WORKS" : "❌ FAILED, using images.edit fallback"}`);
 
-          const prompt = `CRITICAL INSTRUCTION: FACE CONSISTENCY & IDENTITY PRESERVATION
+    let editResults: (string | null)[];
 
-You are editing a real photograph of a specific person. You must return the EXACT SAME photograph with ONLY the clothing changed.
-
-IDENTITY PRESERVATION (highest priority):
-- The person's face is their IDENTITY. Every pixel of their face must be preserved: exact same eyes, eye color, eye shape, eyebrows, nose, nostrils, lips, mouth shape, jawline, chin, cheekbones, forehead, ears, facial hair, wrinkles, moles, freckles, skin texture.
-- Their head shape, hair style, hair color, hair volume, hairline — all identical.
-- Their skin tone across the entire body — identical.
-- Their body proportions, weight, muscle definition — identical.
-- Their exact pose, posture, stance, arm angle, hand position, finger placement — identical.
-- Any items they are holding or wearing that are NOT clothing (phone, glasses, watch) — keep them exactly as they are.
-
-BACKGROUND PRESERVATION:
-- The environment, walls, floor, objects, lighting direction, shadow angles, color temperature, reflections — all identical. Not similar. IDENTICAL.
-
-CLOTHING CHANGES (the ONLY thing you modify):
-- Replace their current top/shirt with: ${outfit.top}
-- Replace their current bottom/pants with: ${outfit.bottom}
-- Replace their footwear with: ${outfit.shoes}
-
-ACCESSORIES TO ADD (place naturally on the person):
-${outfit.accessories?.map((a: string) => "- " + a).join("\n") || "- None"}
-
-The new clothing must fit their exact body shape with realistic fabric draping, wrinkles, and shadows matching the existing lighting. The result must look like the original unedited photo — as if the person was wearing these clothes when the picture was taken.
-
-REMEMBER: If the face changes even 1%, the entire output is a failure. Face identity = #1 priority.`;
-
-          const response = await client.images.edit({
-            model: "gpt-image-1",
-            image: imageFile,
-            prompt: prompt,
-            n: 1,
-            size: "1024x1024",
-          });
-
-          const result = response.data?.[0];
-          if (result?.b64_json) {
-            console.log(`  ✅ ${i + 1}/3 done`);
-            return `data:image/png;base64,${result.b64_json}`;
-          }
-          if (result?.url) {
-            console.log(`  ✅ ${i + 1}/3 done`);
-            return result.url;
-          }
-          console.log(`  ⚠️ ${i + 1}/3 no image returned`);
-          return null;
-        } catch (err: any) {
-          console.error(`  ❌ ${i + 1}/3 failed:`, err?.message || err);
-          return null;
-        }
-      })
-    );
+    if (useResponsesAPI) {
+      // Responses API çalışıyor — tüm outfitler için kullan
+      editResults = [testResult];
+      const remaining = await Promise.all(
+        outfits.slice(1).map(async (outfit: any, i: number) => {
+          console.log(`  Outfit ${i + 2}/3: ${outfit.name} (Responses API)...`);
+          const prompt = buildEditPrompt(outfit, analysis);
+          const result = await editWithResponsesAPI(client, imageDataUrl, prompt);
+          console.log(`  ${result ? "✅" : "❌"} ${i + 2}/3`);
+          return result;
+        })
+      );
+      editResults.push(...remaining);
+    } else {
+      // images.edit fallback — tüm outfitler
+      editResults = await Promise.all(
+        outfits.map(async (outfit: any, i: number) => {
+          console.log(`  Outfit ${i + 1}/3: ${outfit.name} (images.edit)...`);
+          const prompt = buildEditPrompt(outfit, analysis);
+          const result = await editWithImagesAPI(client, imageFile, prompt);
+          console.log(`  ${result ? "✅" : "❌"} ${i + 1}/3`);
+          return result;
+        })
+      );
+    }
 
     const finalOutfits = outfits.map((o: any, i: number) => ({
       name: o.name || ["Safe Stylish", "Trendy Bold", "Premium Luxury"][i],
@@ -169,11 +258,11 @@ REMEMBER: If the face changes even 1%, the entire output is a failure. Face iden
       generatedImage: editResults[i] || null,
     }));
 
-    console.log("All done!");
+    console.log(`Done! Mode: ${useResponsesAPI ? "responses-api" : "images-edit"}`);
 
     return NextResponse.json({
       success: true,
-      mode: "gpt-image-1",
+      mode: useResponsesAPI ? "responses-api" : "images-edit",
       analysis: {
         skinTone: analysis.skinTone || "Medium",
         undertone: analysis.undertone || "Neutral",
