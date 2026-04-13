@@ -3,18 +3,12 @@ import OpenAI, { toFile } from "openai";
 import sharp from "sharp";
 
 // ═══════════════════════════════════════════════════════
-// SADECE images.edit + gpt-image-1 + MASK
+// images.edit + gpt-image-1 + SMOOTH FADE MASK
 //
-// dall-e-3 YOK
-// images.generate YOK
-// Responses API YOK
-//
-// Tek yöntem: openai.images.edit({
-//   model: "gpt-image-1",
-//   image: kullanıcı fotoğrafı,
-//   mask: yüz korumalı mask,
-//   prompt: "..."
-// })
+// Mask:
+//   0% — 55%  → alpha=255 (tam koruma: yüz, saç, boyun)
+//  55% — 70%  → alpha smooth fade (geçiş bölgesi)
+//  70% — 100% → alpha=0 (tam düzenleme: kıyafet, ayakkabı)
 // ═══════════════════════════════════════════════════════
 
 export const maxDuration = 120;
@@ -24,18 +18,30 @@ function getClient(): OpenAI | null {
   return k ? new OpenAI({ apiKey: k }) : null;
 }
 
-// ─── Mask: üst %45 korunan (yüz), alt %55 düzenlenecek (kıyafet) ───
-async function buildMask(size: number): Promise<Buffer> {
-  const cut = Math.floor(0.45 * size);
+async function buildSmoothMask(size: number): Promise<Buffer> {
+  const fadeStart = Math.floor(0.55 * size); // 563px — buraya kadar tam koruma
+  const fadeEnd = Math.floor(0.70 * size);   // 716px — buradan sonra tam düzenleme
   const buf = Buffer.alloc(size * size * 4);
+
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
       const i = (y * size + x) * 4;
-      // üst kısım: alpha=255 (opaque) = KORU
-      // alt kısım: alpha=0 (transparent) = DÜZENLE
-      buf[i + 3] = y < cut ? 255 : 0;
+      let alpha;
+      if (y < fadeStart) {
+        alpha = 255; // tamamen koru (yüz, saç, boyun, üst göğüs)
+      } else if (y > fadeEnd) {
+        alpha = 0; // tamamen değiştir (kıyafet, ayakkabı)
+      } else {
+        const t = (y - fadeStart) / (fadeEnd - fadeStart);
+        alpha = Math.round(255 * (1 - t)); // smooth fade
+      }
+      buf[i] = 0;
+      buf[i + 1] = 0;
+      buf[i + 2] = 0;
+      buf[i + 3] = alpha;
     }
   }
+
   return sharp(buf, { raw: { width: size, height: size, channels: 4 } }).png().toBuffer();
 }
 
@@ -47,19 +53,19 @@ export async function POST(request: NextRequest) {
     const client = getClient();
     if (!client) return NextResponse.json({ success: true, mode: "mock", analysis: mockA(), outfits: mockO() });
 
-    // ═══ Resize to 1024x1024 PNG ═══
+    // Resize to 1024x1024
     const raw = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), "base64");
     const png = await sharp(raw).resize(1024, 1024, { fit: "cover", position: "attention" }).png().toBuffer();
     const dataUrl = `data:image/png;base64,${png.toString("base64")}`;
 
-    // ═══ Mask oluştur ═══
-    const mask = await buildMask(1024);
+    // Smooth fade mask
+    const mask = await buildSmoothMask(1024);
 
-    // ═══ SDK file objects ═══
+    // SDK file objects
     const imageFile = await toFile(png, "photo.png", { type: "image/png" });
     const maskFile = await toFile(mask, "mask.png", { type: "image/png" });
 
-    // ═══ Analyze (gpt-4o text) ═══
+    // Analyze
     let analysis: any;
     try {
       const r = await client.chat.completions.create({
@@ -72,7 +78,7 @@ export async function POST(request: NextRequest) {
       analysis = JSON.parse((r.choices[0]?.message?.content || "{}").replace(/```json|```/g, "").trim());
     } catch { analysis = mockA(); }
 
-    // ═══ Outfits (gpt-4o text) ═══
+    // Outfits
     const sl: Record<string, string> = {
       "old-money": "Old Money", streetwear: "Streetwear", minimal: "Minimalist",
       "smart-casual": "Smart Casual", luxury: "Luxury", sport: "Athleisure",
@@ -88,13 +94,12 @@ export async function POST(request: NextRequest) {
       outfits = JSON.parse((r.choices[0]?.message?.content || "[]").replace(/```json|```/g, "").trim());
     } catch { outfits = mockO(); }
 
-    // ═══ EDIT PHOTOS: images.edit + gpt-image-1 + mask ═══
+    // Edit photos: images.edit + gpt-image-1 + smooth mask
     const results: (string | null)[] = [];
 
     for (let i = 0; i < outfits.length; i++) {
       const o = outfits[i];
       console.log(`[${i + 1}/3] ${o.name}...`);
-
       try {
         const prompt = `Keep the EXACT same person, same face, same identity, same skin tone, same hair. Do NOT change facial features. Only replace clothing. Preserve lighting, pose and background.
 
@@ -104,7 +109,7 @@ New clothing:
 - Shoes: ${o.shoes}
 - Accessories: ${o.accessories?.join(", ") || "none"}
 
-The clothing must fit the person naturally. Result must look like the original unedited photo with different clothes.`;
+The clothing must fit the person naturally with realistic fabric and shadows. Result must look like the original unedited photo with different clothes.`;
 
         const response = await (client.images.edit as any)({
           model: "gpt-image-1",
@@ -124,7 +129,7 @@ The clothing must fit the person naturally. Result must look like the original u
           console.log(`[${i + 1}/3] ✅`);
         } else {
           results.push(null);
-          console.log(`[${i + 1}/3] ⚠️ no image`);
+          console.log(`[${i + 1}/3] ⚠️`);
         }
       } catch (err: any) {
         console.error(`[${i + 1}/3] ❌ ${err?.message?.substring(0, 200)}`);
@@ -136,7 +141,7 @@ The clothing must fit the person naturally. Result must look like the original u
 
     return NextResponse.json({
       success: true,
-      mode: "gpt-image-1-edit",
+      mode: "gpt-image-1-smooth-mask",
       analysis: {
         skinTone: analysis.skinTone || "Medium",
         undertone: analysis.undertone || "Neutral",
