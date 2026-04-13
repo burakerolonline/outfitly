@@ -14,7 +14,7 @@ export default function DashboardPage({ onNavigate }: { onNavigate: (page: strin
     productLink, setProductLink,
     generating, genStep,
     setGenerating, setGenStep,
-    setAnalysis, setOutfits,
+    setAnalysis, setOutfits, setGenerationMode,
     consumeCredit, addHistory,
     user, setShowPaywall, setShowAuth,
   } = useStore();
@@ -87,6 +87,7 @@ export default function DashboardPage({ onNavigate }: { onNavigate: (page: strin
       // Step 4: Generating outfits
       setGenStep(3);
       setOutfits(data.outfits);
+      setGenerationMode(data.mode || "dalle-only");
       await new Promise((r) => setTimeout(r, 600));
 
       // Step 5: Done

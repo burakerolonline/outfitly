@@ -7,7 +7,7 @@ import { STYLES, AI_PROMPTS } from "@/lib/constants";
 import { Heart, Share2, Download, ImageIcon } from "lucide-react";
 
 export default function ResultsPage({ onNavigate }: { onNavigate: (page: string) => void }) {
-  const { outfits, analysis, selectedStyle, uploadedImage, favorites, toggleFavorite, productLink } = useStore();
+  const { outfits, analysis, selectedStyle, uploadedImage, favorites, toggleFavorite, productLink, generationMode } = useStore();
   const [activeTab, setActiveTab] = useState(0);
   const styleData = STYLES.find((s) => s.id === selectedStyle);
 
@@ -143,7 +143,7 @@ export default function ResultsPage({ onNavigate }: { onNavigate: (page: string)
                 className="px-4 py-3 text-[11px] font-bold uppercase tracking-[2px] text-center text-white"
                 style={{ background: "linear-gradient(135deg, var(--gradient-1), var(--gradient-2))" }}
               >
-                ✨ AI Generated — {currentOutfit?.name} — DALL-E 3
+                ✨ AI STYLED — {currentOutfit?.name}
               </div>
               <div className="p-4 flex justify-center items-center" style={{ minHeight: 400 }}>
                 {currentOutfit?.generatedImage ? (

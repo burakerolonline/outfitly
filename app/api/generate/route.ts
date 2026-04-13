@@ -1,59 +1,112 @@
 import { NextRequest, NextResponse } from "next/server";
 
 // ═══════════════════════════════════════════════════════
-// POST /api/generate
+// AI OUTFIT GENERATOR — Same method as ChatGPT
 //
 // PIPELINE:
 //   1. GPT-4o Vision  → analyze user photo
-//   2. GPT-4o         → generate outfit descriptions
-//   3. DALL-E 3       → generate outfit images (3x)
+//   2. GPT-4o         → recommend outfits
+//   3. gpt-image-1    → edit YOUR photo with each outfit
+//                       (keeps your face, body, pose — only changes clothes)
 //
-// Requires: OPENAI_API_KEY in environment variables
+// Only needs: OPENAI_API_KEY
 // ═══════════════════════════════════════════════════════
 
 const OPENAI_URL = "https://api.openai.com/v1";
 
-async function callGPT(apiKey: string, messages: any[], maxTokens = 1000, temperature = 0.5) {
+// ─── Helper: Call GPT-4o ─────────────────────────────
+async function callGPT(apiKey: string, messages: any[], maxTokens = 1000, temp = 0.5) {
   const res = await fetch(`${OPENAI_URL}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      messages,
-      max_tokens: maxTokens,
-      temperature,
-    }),
+    body: JSON.stringify({ model: "gpt-4o", messages, max_tokens: maxTokens, temperature: temp }),
   });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`GPT error: ${err}`);
-  }
+  if (!res.ok) throw new Error(`GPT error: ${await res.text()}`);
   const data = await res.json();
   return data.choices?.[0]?.message?.content || "";
 }
 
-async function generateImage(apiKey: string, prompt: string): Promise<string> {
-  const res = await fetch(`${OPENAI_URL}/images/generations`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "dall-e-3",
-      prompt,
-      n: 1,
-      size: "1024x1024",
-      quality: "hd",
-      style: "natural",
-    }),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    console.error("DALL-E error:", err);
-    throw new Error(`DALL-E error: ${err}`);
+// ─── Helper: Edit photo with gpt-image-1 ────────────
+// This is the same method ChatGPT uses to edit your photo
+async function editPhoto(apiKey: string, imageBase64: string, prompt: string): Promise<string | null> {
+  try {
+    // Strip data URL prefix to get raw base64
+    const base64Clean = imageBase64.replace(/^data:image\/\w+;base64,/, "");
+    const imageBuffer = Buffer.from(base64Clean, "base64");
+
+    // Create form data with the image
+    const formData = new FormData();
+    const imageBlob = new Blob([imageBuffer], { type: "image/png" });
+    formData.append("image", imageBlob, "photo.png");
+    formData.append("model", "gpt-image-1");
+    formData.append("prompt", prompt);
+    formData.append("n", "1");
+    formData.append("size", "1024x1024");
+    formData.append("quality", "high");
+
+    const res = await fetch(`${OPENAI_URL}/images/edits`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: formData,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error("gpt-image-1 edit error:", errText);
+
+      // Fallback: try with dall-e-2 edits endpoint
+      console.log("Trying dall-e-2 fallback...");
+      return await editPhotoFallback(apiKey, imageBuffer, prompt);
+    }
+
+    const data = await res.json();
+
+    // Response may contain b64_json or url
+    if (data.data?.[0]?.b64_json) {
+      return `data:image/png;base64,${data.data[0].b64_json}`;
+    }
+    return data.data?.[0]?.url || null;
+  } catch (err) {
+    console.error("Photo edit error:", err);
+    return null;
   }
-  const data = await res.json();
-  return data.data?.[0]?.url || "";
 }
 
+// ─── Fallback: DALL-E 2 edit ─────────────────────────
+async function editPhotoFallback(apiKey: string, imageBuffer: Buffer, prompt: string): Promise<string | null> {
+  try {
+    const formData = new FormData();
+    const imageBlob = new Blob([imageBuffer], { type: "image/png" });
+    formData.append("image", imageBlob, "photo.png");
+    formData.append("model", "dall-e-2");
+    formData.append("prompt", prompt);
+    formData.append("n", "1");
+    formData.append("size", "1024x1024");
+
+    const res = await fetch(`${OPENAI_URL}/images/edits`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: formData,
+    });
+
+    if (!res.ok) {
+      console.error("dall-e-2 fallback error:", await res.text());
+      return null;
+    }
+
+    const data = await res.json();
+    if (data.data?.[0]?.b64_json) {
+      return `data:image/png;base64,${data.data[0].b64_json}`;
+    }
+    return data.data?.[0]?.url || null;
+  } catch {
+    return null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// MAIN HANDLER
+// ═══════════════════════════════════════════════════════
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -65,154 +118,138 @@ export async function POST(request: NextRequest) {
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      console.warn("No OPENAI_API_KEY — returning mock data");
-      return NextResponse.json({ success: true, analysis: getMockAnalysis(), outfits: getMockOutfits(style) });
+      return NextResponse.json({ success: true, mode: "mock", analysis: getMockAnalysis(), outfits: getMockOutfits() });
     }
 
-    // ═════════════════════════════════════════════════
-    // STEP 1: GPT-4o Vision — Analyze User Photo
-    // ═════════════════════════════════════════════════
-    console.log("Step 1: Analyzing photo with GPT-4o Vision...");
-
     const imageUrl = imageBase64.startsWith("data:") ? imageBase64 : `data:image/jpeg;base64,${imageBase64}`;
+
+    // ═════════════════════════════════════════════════
+    // STEP 1: GPT-4o Vision → Analyze Photo
+    // ═════════════════════════════════════════════════
+    console.log("🔍 Step 1: Analyzing photo...");
 
     const analysisText = await callGPT(apiKey, [{
       role: "user",
       content: [
         {
           type: "text",
-          text: `You are an expert fashion analyst. Analyze this person's photo.
-
-Detect:
-- skinTone: Light / Medium / Olive / Dark
-- undertone: Warm / Cool / Neutral
-- faceShape: Oval / Round / Square / Heart / Oblong
-- bodyType: Ectomorph / Mesomorph / Endomorph / Athletic
-- hairColor: describe color
-- gender: Male / Female
-- age: approximate age range (e.g. "25-30")
-- additionalNotes: any style-relevant observations (glasses, beard, etc.)
-
-Respond ONLY with valid JSON, no markdown:
-{"skinTone":"...","undertone":"...","faceShape":"...","bodyType":"...","hairColor":"...","gender":"...","age":"...","additionalNotes":"...","confidence":95}`,
+          text: `Analyze this person for fashion styling. Respond ONLY valid JSON:
+{"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"...","distinctFeatures":"glasses, beard, etc or none","confidence":95}`,
         },
         { type: "image_url", image_url: { url: imageUrl } },
       ],
-    }], 500, 0.3);
+    }], 400, 0.3);
 
     let analysis;
     try {
       analysis = JSON.parse(analysisText.replace(/```json|```/g, "").trim());
     } catch {
-      console.error("Analysis parse failed:", analysisText);
       analysis = getMockAnalysis();
     }
 
     // ═════════════════════════════════════════════════
-    // STEP 2: GPT-4o — Generate Outfit Descriptions
+    // STEP 2: GPT-4o → Outfit Recommendations
     // ═════════════════════════════════════════════════
-    console.log("Step 2: Generating outfit descriptions...");
+    console.log("👔 Step 2: Generating outfit ideas...");
 
     const styleMap: Record<string, string> = {
-      "old-money": "Old Money / Quiet Luxury (Ralph Lauren, Brunello Cucinelli, Loro Piana). Timeless, no logos, cashmere, wool, earth tones.",
-      streetwear: "Streetwear / Urban (Nike, Off-White, Jordan). Bold graphics, oversized, sneaker culture.",
-      minimal: "Minimalist / Scandinavian (COS, Acne Studios, Jil Sander). Clean lines, neutrals, structure.",
-      "smart-casual": "Smart Casual (Massimo Dutti, Reiss). Polished but relaxed, chinos, loafers.",
-      luxury: "High Luxury (Tom Ford, Gucci, Saint Laurent). Premium materials, statement pieces.",
-      sport: "Sport / Athleisure (Nike Tech, Lululemon). Performance fabrics, sleek silhouettes.",
+      "old-money": "Old Money / Quiet Luxury (Ralph Lauren, Brunello Cucinelli)",
+      streetwear: "Streetwear / Urban (Nike, Off-White, Jordan)",
+      minimal: "Minimalist (COS, Acne Studios, Jil Sander)",
+      "smart-casual": "Smart Casual (Massimo Dutti, Reiss)",
+      luxury: "High Luxury (Tom Ford, Gucci, Saint Laurent)",
+      sport: "Athleisure (Nike Tech, Lululemon)",
     };
 
     const outfitText = await callGPT(apiKey, [{
       role: "user",
-      content: `You are a world-class fashion stylist.
+      content: `You are a world-class stylist.
 
-PERSON:
-- Gender: ${analysis.gender || "Unknown"}
-- Age: ${analysis.age || "25-35"}
-- Skin: ${analysis.skinTone}, ${analysis.undertone} undertone
-- Face: ${analysis.faceShape}
-- Body: ${analysis.bodyType}
-- Hair: ${analysis.hairColor}
-- Notes: ${analysis.additionalNotes || "none"}
+PERSON: ${analysis.gender}, ~${analysis.age}, ${analysis.skinTone} skin (${analysis.undertone} undertone), ${analysis.hairColor} hair, ${analysis.bodyType} build. ${analysis.distinctFeatures || ""}
 
 STYLE: ${styleMap[style] || style}
-${productUrl ? `MUST INCLUDE THIS PRODUCT: ${productUrl}` : ""}
+${productUrl ? `MUST INCLUDE: ${productUrl}` : ""}
 
 COLOR RULES for ${analysis.undertone} undertone:
-${analysis.undertone === "Warm" ? "Best: earth tones, camel, olive, rust, burgundy, gold jewelry. Avoid: icy blues, stark white." :
-  analysis.undertone === "Cool" ? "Best: jewel tones, navy, emerald, sapphire, silver jewelry. Avoid: orange, warm yellow." :
-  "Versatile: both warm and cool work. Mixed metals. Wide range of colors."}
+${analysis.undertone === "Warm" ? "Best: earth tones, camel, olive, rust, gold" : analysis.undertone === "Cool" ? "Best: jewel tones, navy, emerald, silver" : "Versatile: both warm and cool work"}
 
-Generate exactly 3 outfits. Respond ONLY with a JSON array (no markdown):
+Generate 3 outfits. Respond ONLY with JSON array:
 [
   {
     "name": "Safe Stylish",
-    "description": "one-line description of this look",
-    "top": "specific garment, fabric, fit, color name + hex",
-    "bottom": "specific garment, fabric, fit, color name + hex",
-    "shoes": "specific shoe, material, color",
+    "description": "one line look description",
+    "top": "garment, fabric, color with hex",
+    "bottom": "garment, fabric, color with hex",
+    "shoes": "shoe style, material, color",
     "accessories": ["item1", "item2", "item3"],
     "colors": ["#hex1", "#hex2", "#hex3"],
-    "occasion": "where to wear",
-    "imagePrompt": "detailed prompt to generate this outfit on a ${analysis.gender || 'person'}, ${analysis.age || '25-30'} years old, ${analysis.skinTone} skin, ${analysis.hairColor} hair, full body shot, fashion photography, studio lighting"
+    "occasion": "where to wear"
   },
   { "name": "Trendy Bold", ... },
   { "name": "Premium Luxury", ... }
-]
-
-CRITICAL: The "imagePrompt" must be extremely detailed and describe the FULL outfit visually for image generation. Include: exact clothing items, colors, fabrics, styling details, model description matching the user, photography style.`,
-    }], 2500, 0.7);
+]`,
+    }], 2000, 0.7);
 
     let outfits;
     try {
       outfits = JSON.parse(outfitText.replace(/```json|```/g, "").trim());
     } catch {
-      console.error("Outfits parse failed:", outfitText);
-      outfits = getMockOutfits(style);
+      outfits = [
+        { name: "Safe Stylish", description: "", top: "N/A", bottom: "N/A", shoes: "N/A", accessories: [], colors: ["#333","#666","#999"], occasion: "" },
+        { name: "Trendy Bold", description: "", top: "N/A", bottom: "N/A", shoes: "N/A", accessories: [], colors: ["#333","#666","#999"], occasion: "" },
+        { name: "Premium Luxury", description: "", top: "N/A", bottom: "N/A", shoes: "N/A", accessories: [], colors: ["#333","#666","#999"], occasion: "" },
+      ];
     }
 
     // ═════════════════════════════════════════════════
-    // STEP 3: DALL-E 3 — Generate Outfit Images
+    // STEP 3: gpt-image-1 → Edit YOUR photo with outfits
+    // Same method ChatGPT uses — keeps your face, changes clothes
     // ═════════════════════════════════════════════════
-    console.log("Step 3: Generating outfit images with DALL-E 3...");
+    console.log("🎨 Step 3: Editing your photo with outfits (gpt-image-1)...");
 
-    const imagePromises = outfits.map(async (outfit: any, index: number) => {
-      try {
-        // Build a rich image prompt
-        const prompt = outfit.imagePrompt ||
-          `Fashion photography, full body shot of a ${analysis.gender || "person"}, ${analysis.age || "25-30"} years old, ${analysis.skinTone} skin tone, ${analysis.hairColor} hair. Wearing: ${outfit.top}, ${outfit.bottom}, ${outfit.shoes}. Accessories: ${outfit.accessories?.join(", ") || "none"}. Style: ${styleMap[style] || style}. Professional studio lighting, high fashion magazine quality, photorealistic, elegant pose, clean background.`;
+    const editResults = await Promise.all(
+      outfits.map(async (outfit: any, i: number) => {
+        const editPrompt = `Edit this photo. Keep the EXACT same person, same face, same pose, same background, same lighting. ONLY change their clothes.
 
-        // Safety prefix to ensure quality
-        const safePrompt = `High-end fashion editorial photograph. ${prompt} Shot on medium format camera, soft professional lighting, neutral studio background, 8k quality, ultra detailed clothing textures.`;
+Replace their current outfit with:
+- Top: ${outfit.top}
+- Bottom: ${outfit.bottom}  
+- Shoes: ${outfit.shoes}
+- Accessories: ${outfit.accessories?.join(", ") || "none"}
 
-        console.log(`Generating image ${index + 1}/3...`);
-        const imageUrl = await generateImage(apiKey, safePrompt);
-        return imageUrl;
-      } catch (err) {
-        console.error(`Image generation failed for outfit ${index + 1}:`, err);
-        return null;
-      }
-    });
+The new outfit must look completely natural and photorealistic on this person. Do NOT change their face, hair, skin, body shape, or background. Only the clothing changes.`;
 
-    const generatedImages = await Promise.all(imagePromises);
+        console.log(`  Editing outfit ${i + 1}/3: ${outfit.name}...`);
 
-    // Attach images to outfits
-    const outfitsWithImages = outfits.map((outfit: any, i: number) => ({
-      name: outfit.name || ["Safe Stylish", "Trendy Bold", "Premium Luxury"][i],
-      description: outfit.description || "",
-      top: outfit.top || "Not specified",
-      bottom: outfit.bottom || "Not specified",
-      shoes: outfit.shoes || "Not specified",
-      accessories: outfit.accessories || [],
-      colors: outfit.colors || ["#333", "#666", "#999"],
-      occasion: outfit.occasion || "",
-      generatedImage: generatedImages[i] || null,
+        try {
+          const result = await editPhoto(apiKey, imageBase64, editPrompt);
+          console.log(`  ✅ Outfit ${i + 1} done`);
+          return result;
+        } catch (err) {
+          console.error(`  ❌ Outfit ${i + 1} failed:`, err);
+          return null;
+        }
+      })
+    );
+
+    // Build final response
+    const finalOutfits = outfits.map((o: any, i: number) => ({
+      name: o.name || ["Safe Stylish", "Trendy Bold", "Premium Luxury"][i],
+      description: o.description || "",
+      top: o.top || "",
+      bottom: o.bottom || "",
+      shoes: o.shoes || "",
+      accessories: o.accessories || [],
+      colors: o.colors || ["#333", "#666", "#999"],
+      occasion: o.occasion || "",
+      generatedImage: editResults[i],
     }));
 
-    console.log("Done! Returning results.");
+    console.log("✅ All done!");
 
     return NextResponse.json({
       success: true,
+      mode: "photo-edit",
       analysis: {
         skinTone: analysis.skinTone || "Medium",
         undertone: analysis.undertone || "Neutral",
@@ -222,31 +259,22 @@ CRITICAL: The "imagePrompt" must be extremely detailed and describe the FULL out
         gender: analysis.gender || "Unknown",
         confidence: analysis.confidence || "90",
       },
-      outfits: outfitsWithImages,
+      outfits: finalOutfits,
     });
   } catch (error: any) {
-    console.error("Generation error:", error);
+    console.error("❌ Error:", error);
     return NextResponse.json({ error: error.message || "Generation failed" }, { status: 500 });
   }
 }
 
-// ─── FALLBACK MOCK DATA ────────────────────────────
+// ─── Mock data ───────────────────────────────────────
 function getMockAnalysis() {
-  return {
-    skinTone: ["Light", "Medium", "Olive", "Dark"][Math.floor(Math.random() * 4)],
-    undertone: ["Warm", "Cool", "Neutral"][Math.floor(Math.random() * 3)],
-    faceShape: ["Oval", "Round", "Square", "Heart"][Math.floor(Math.random() * 4)],
-    bodyType: ["Ectomorph", "Mesomorph", "Athletic"][Math.floor(Math.random() * 3)],
-    hairColor: "Brown",
-    gender: "Male",
-    confidence: "92",
-  };
+  return { skinTone: "Medium", undertone: "Warm", faceShape: "Oval", bodyType: "Mesomorph", hairColor: "Brown", gender: "Male", confidence: "92" };
 }
-
-function getMockOutfits(style: string) {
+function getMockOutfits() {
   return [
-    { name: "Safe Stylish", description: "Classic and universally flattering", top: "Navy cashmere sweater (#1B2A4A)", bottom: "Beige tailored chinos (#D2B48C)", shoes: "Brown suede loafers", accessories: ["Gold watch", "Leather belt"], colors: ["#1B2A4A", "#D2B48C", "#8B6914"], occasion: "Business casual", generatedImage: null },
-    { name: "Trendy Bold", description: "Fashion-forward statement", top: "Olive oversized shirt (#556B2F)", bottom: "Black wide-leg trousers (#1A1A1A)", shoes: "White chunky sneakers", accessories: ["Chain necklace", "Sunglasses"], colors: ["#556B2F", "#1A1A1A", "#FFFFFF"], occasion: "Weekend outing", generatedImage: null },
-    { name: "Premium Luxury", description: "High-end designer quality", top: "Burgundy merino turtleneck (#722F37)", bottom: "Charcoal wool dress pants (#36454F)", shoes: "Cognac Oxford brogues", accessories: ["Silk pocket square", "Cufflinks"], colors: ["#722F37", "#36454F", "#C68E17"], occasion: "Upscale dinner", generatedImage: null },
+    { name: "Safe Stylish", description: "Classic and flattering", top: "Navy sweater (#1B2A4A)", bottom: "Beige chinos (#D2B48C)", shoes: "Brown loafers", accessories: ["Gold watch", "Belt"], colors: ["#1B2A4A", "#D2B48C", "#8B6914"], occasion: "Business casual", generatedImage: null },
+    { name: "Trendy Bold", description: "Fashion-forward", top: "Olive shirt (#556B2F)", bottom: "Black trousers (#1A1A1A)", shoes: "White sneakers", accessories: ["Chain", "Sunglasses"], colors: ["#556B2F", "#1A1A1A", "#FFF"], occasion: "Weekend", generatedImage: null },
+    { name: "Premium Luxury", description: "High-end quality", top: "Burgundy turtleneck (#722F37)", bottom: "Charcoal pants (#36454F)", shoes: "Oxford brogues", accessories: ["Pocket square", "Cufflinks"], colors: ["#722F37", "#36454F", "#C68E17"], occasion: "Dinner", generatedImage: null },
   ];
 }

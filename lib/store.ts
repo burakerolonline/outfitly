@@ -66,10 +66,12 @@ interface AppState {
   genStep: number;
   analysis: Analysis | null;
   outfits: Outfit[] | null;
+  generationMode: "virtual-tryon" | "dalle-only" | null;
   setGenerating: (v: boolean) => void;
   setGenStep: (v: number) => void;
   setAnalysis: (v: Analysis | null) => void;
   setOutfits: (v: Outfit[] | null) => void;
+  setGenerationMode: (v: "virtual-tryon" | "dalle-only" | null) => void;
   consumeCredit: () => void;
 
   history: HistoryItem[];
@@ -123,10 +125,12 @@ export const useStore = create<AppState>((set) => ({
   genStep: 0,
   analysis: null,
   outfits: null,
+  generationMode: null,
   setGenerating: (v) => set({ generating: v }),
   setGenStep: (v) => set({ genStep: v }),
   setAnalysis: (v) => set({ analysis: v }),
   setOutfits: (v) => set({ outfits: v }),
+  setGenerationMode: (v) => set({ generationMode: v }),
   consumeCredit: () => {
     set((s) => ({
       user: s.user && s.user.plan === "free"
