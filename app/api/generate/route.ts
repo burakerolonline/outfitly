@@ -4,28 +4,22 @@ import sharp from "sharp";
 export const maxDuration = 120;
 const API = "https://api.openai.com/v1";
 
-// ─── Analiz + kıyafet metni ───────────────────────────────────────────────────
+// ─── GPT-4o: Görsel analiz ────────────────────────────────────────────────────
 async function gptVision(apiKey: string, imageDataUrl: string, prompt: string): Promise<string> {
   const res = await fetch(`${API}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "gpt-4o",
-      messages: [{
-        role: "user",
-        content: [
-          { type: "image_url", image_url: { url: imageDataUrl } },
-          { type: "text", text: prompt },
-        ],
-      }],
+      messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: imageDataUrl } }, { type: "text", text: prompt }] }],
       max_tokens: 1500,
     }),
   });
   if (!res.ok) throw new Error(`gptVision ${res.status}: ${(await res.text()).substring(0, 300)}`);
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content || "";
+  return (await res.json()).choices?.[0]?.message?.content || "";
 }
 
+// ─── GPT-4o: Kıyafet önerisi metni ───────────────────────────────────────────
 async function gptText(apiKey: string, prompt: string): Promise<string> {
   const res = await fetch(`${API}/chat/completions`, {
     method: "POST",
@@ -37,40 +31,56 @@ async function gptText(apiKey: string, prompt: string): Promise<string> {
     }),
   });
   if (!res.ok) throw new Error(`gptText ${res.status}: ${(await res.text()).substring(0, 300)}`);
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content || "";
+  return (await res.json()).choices?.[0]?.message?.content || "";
 }
 
-// ─── ChatGPT ile AYNI yöntem: Responses API + gpt-4o + image_generation ───────
-async function generateOutfitImage(
+// ─── MASK üretici ─────────────────────────────────────────────────────────────
+// Üst %35 = yüz/baş bölgesi → OPAQUE (alpha=255) → korunur, dokunulmaz
+// Alt %65 = kıyafet/vücut bölgesi → TRANSPARENT (alpha=0) → edit edilir
+async function createMask(width: number, height: number): Promise<Buffer> {
+  const preserveHeight = Math.floor(height * 0.35); // korunacak alan yüksekliği
+
+  // Önce tam transparent bir canvas oluştur (edit edilecek alan)
+  const base = await sharp({
+    create: { width, height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+  }).png().toBuffer();
+
+  // Üstüne opaque beyaz katman koy (yüz/baş — korunacak alan)
+  const faceBlock = await sharp({
+    create: { width, height: preserveHeight, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 255 } },
+  }).png().toBuffer();
+
+  return sharp(base)
+    .composite([{ input: faceBlock, top: 0, left: 0 }])
+    .png()
+    .toBuffer();
+}
+
+// ─── GERÇEK INPAINTING: gpt-image-1 + mask ───────────────────────────────────
+// Mask sayesinde yüze hiç dokunulmaz — sadece kıyafet bölgesi yeniden üretilir
+async function inpaintOutfit(
   apiKey: string,
-  imageDataUrl: string,
+  pngBuffer: Buffer,
+  maskBuffer: Buffer,
   outfit: { top: string; bottom: string; shoes: string; accessories: string[] }
 ): Promise<{ image: string | null; debug: string }> {
   try {
-    const prompt = [
-      "You are looking at a photo of a real person.",
-      "Generate a new version of this photo where ONLY the clothing has changed.",
-      "KEEP IDENTICAL — do not alter in any way: the person's face, eyes, nose, mouth, facial hair, hair style, hair color, skin tone, body proportions, pose, hand positions, facial expression, background, lighting, and shadows.",
-      "The output must show the EXACT same individual from the EXACT same photo — not a similar-looking person.",
-      `Replace ONLY the outfit with: Top: ${outfit.top}. Bottom: ${outfit.bottom}. Shoes: ${outfit.shoes}. Accessories: ${outfit.accessories?.join(", ") || "none"}.`,
-      "The clothing must look photorealistic, naturally lit to match the original photo's lighting and environment.",
-    ].join(" ");
+    // Kısa ve net prompt — uzun negatif listeler modeli karıştırıyor
+    const prompt = `Dress this exact person in: ${outfit.top}, ${outfit.bottom}, ${outfit.shoes}${outfit.accessories?.length ? ", " + outfit.accessories.join(", ") : ""}. Preserve the person's face, identity, pose, and background exactly.`;
 
-    const res = await fetch(`${API}/responses`, {
+    const formData = new FormData();
+    formData.append("image", new Blob([new Uint8Array(pngBuffer)], { type: "image/png" }), "person.png");
+    formData.append("mask",  new Blob([new Uint8Array(maskBuffer)], { type: "image/png" }), "mask.png");
+    formData.append("prompt", prompt);
+    formData.append("model", "gpt-image-1");
+    formData.append("size", "1024x1024");
+    formData.append("quality", "high");
+    formData.append("n", "1");
+
+    const res = await fetch(`${API}/images/edits`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        input: [{
-          role: "user",
-          content: [
-            { type: "input_image", image_url: imageDataUrl },
-            { type: "input_text", text: prompt },
-          ],
-        }],
-        tools: [{ type: "image_generation", quality: "high", size: "1024x1024" }],
-      }),
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: formData,
     });
 
     if (!res.ok) {
@@ -79,20 +89,10 @@ async function generateOutfitImage(
     }
 
     const data = await res.json();
+    if (data.data?.[0]?.b64_json) return { image: `data:image/png;base64,${data.data[0].b64_json}`, debug: "inpainting mask ✓" };
+    if (data.data?.[0]?.url)      return { image: data.data[0].url, debug: "inpainting mask (url) ✓" };
 
-    for (const b of data.output || []) {
-      if (b.type === "image_generation_call" && b.result) {
-        return { image: `data:image/png;base64,${b.result}`, debug: "Responses API gpt-4o ✓" };
-      }
-      if (b.type === "message" && b.content) {
-        for (const c of b.content) {
-          if (c.type === "output_image" && c.image_url) return { image: c.image_url, debug: "output_image ✓" };
-          if (c.type === "image_generation_call" && c.result) return { image: `data:image/png;base64,${c.result}`, debug: "nested image_generation_call ✓" };
-        }
-      }
-    }
-
-    return { image: null, debug: `Görsel bulunamadı. Yanıt: ${JSON.stringify(data.output?.map((b: any) => b.type)).substring(0, 200)}` };
+    return { image: null, debug: `Beklenmedik yanıt: ${JSON.stringify(data).substring(0, 200)}` };
   } catch (e: any) {
     return { image: null, debug: `Exception: ${e?.message?.substring(0, 200)}` };
   }
@@ -109,16 +109,25 @@ export async function POST(request: NextRequest) {
 
     const raw = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), "base64");
 
-    // JPEG — analiz + Responses API için (küçük, hızlı)
+    // PNG 1024x1024 — inpainting için
+    const pngBuffer = await sharp(raw)
+      .resize(1024, 1024, { fit: "cover", position: "attention" })
+      .png({ compressionLevel: 7 })
+      .toBuffer();
+
+    // JPEG — analiz için (küçük, hızlı)
     const jpgDataUrl = `data:image/jpeg;base64,${(
-      await sharp(raw).resize(1024, 1024, { fit: "cover", position: "attention" }).jpeg({ quality: 85 }).toBuffer()
+      await sharp(raw).resize(800, 800, { fit: "cover", position: "attention" }).jpeg({ quality: 80 }).toBuffer()
     ).toString("base64")}`;
 
-    // ── STEP 1: Fotoğraf analizi ──────────────────────────
+    // Mask bir kez üretilir, 3 görsel için paylaşılır
+    const maskBuffer = await createMask(1024, 1024);
+
+    // ── STEP 1: Analiz ────────────────────────────────────
     let analysis: any;
     try {
       const r = await gptVision(apiKey, jpgDataUrl,
-        'Analyze this person. Return ONLY valid JSON, no extra text: {"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"25-30","confidence":95}'
+        'Analyze this person. Return ONLY valid JSON: {"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"25-30","confidence":95}'
       );
       analysis = JSON.parse(r.replace(/```json|```/g, "").trim());
     } catch { analysis = mockA(); }
@@ -131,18 +140,17 @@ export async function POST(request: NextRequest) {
     let outfits: any[];
     try {
       const r = await gptText(apiKey,
-        `You are a professional stylist. Person: ${analysis.gender}, ${analysis.age}, ${analysis.skinTone} skin (${analysis.undertone} undertone), ${analysis.hairColor} hair, ${analysis.bodyType} body. Style: ${styleLabels[style] || style}. ${productUrl ? "Incorporate: " + productUrl : ""} Generate 3 outfits. Return ONLY a JSON array: [{"name":"Safe Stylish","description":"...","top":"detailed description","bottom":"detailed description","shoes":"detailed description","accessories":["item1","item2"],"colors":["#hex1","#hex2","#hex3"],"occasion":"..."},{"name":"Trendy Bold",...},{"name":"Premium Luxury",...}]`
+        `Professional stylist. Person: ${analysis.gender}, ${analysis.age}, ${analysis.skinTone} skin (${analysis.undertone} undertone), ${analysis.hairColor} hair, ${analysis.bodyType} body. Style: ${styleLabels[style] || style}. ${productUrl ? "Incorporate: " + productUrl : ""} Generate 3 outfits. Return ONLY JSON array: [{"name":"Safe Stylish","description":"...","top":"...","bottom":"...","shoes":"...","accessories":["..."],"colors":["#hex","#hex","#hex"],"occasion":"..."},{"name":"Trendy Bold",...},{"name":"Premium Luxury",...}]`
       );
       outfits = JSON.parse(r.replace(/```json|```/g, "").trim());
     } catch { outfits = mockO(); }
 
-    // ── STEP 3: 3 görsel PARALEL üretim ──────────────────
-    // Paralel: ~55sn (en yavaş tek görsel kadar), sıralı: ~165sn (timeout)
-    console.log("3 görsel paralel üretiliyor...");
+    // ── STEP 3: 3 görsel PARALEL inpainting ──────────────
+    console.log("3 görsel paralel inpainting başlatıldı...");
     const results = await Promise.all(
       outfits.map((o: any, i: number) => {
         console.log(`[${i + 1}/3] "${o.name}" başlatıldı`);
-        return generateOutfitImage(apiKey, jpgDataUrl, {
+        return inpaintOutfit(apiKey, pngBuffer, maskBuffer, {
           top: o.top, bottom: o.bottom, shoes: o.shoes, accessories: o.accessories || [],
         });
       })
@@ -151,7 +159,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      mode: "gpt-4o-responses-parallel",
+      mode: "inpainting-mask",
       analysis: {
         skinTone: analysis.skinTone || "Medium", undertone: analysis.undertone || "Neutral",
         faceShape: analysis.faceShape || "Oval", bodyType: analysis.bodyType || "Mesomorph",
