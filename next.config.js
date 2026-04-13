@@ -1,19 +1,16 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   images: {
-    domains: [],
     remotePatterns: [
       {
         protocol: "https",
-        hostname: "**",
+        hostname: "oaidalleapiprodscus.blob.core.windows.net",
+      },
+      {
+        protocol: "https",
+        hostname: "dalleprodsec.blob.core.windows.net",
       },
     ],
-  },
-  // API routes need more time for AI generation
-  experimental: {
-    serverActions: {
-      bodySizeLimit: "10mb",
-    },
   },
 };
 
