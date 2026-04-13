@@ -1,171 +1,149 @@
 import { NextRequest, NextResponse } from "next/server";
+import sharp from "sharp";
 
 // ═══════════════════════════════════════════════════════
-// Raw fetch only — no SDK type issues
-// Detailed logging to find the exact problem
+// MASK-BASED INPAINTING
+//
+// 1. GPT-4o Vision → analiz + yüz pozisyonu tespit
+// 2. sharp → mask oluştur (yüz=korunan, gövde=düzenlenecek)
+// 3. images.edit + mask → SADECE kıyafet alanı düzenlenir
+//    Yüz pikselleri HİÇ değişmez.
 // ═══════════════════════════════════════════════════════
 
 export const maxDuration = 120;
 
 const OPENAI = "https://api.openai.com/v1";
 
+// ─── GPT-4o text çağrısı ───
 async function gptText(apiKey: string, messages: any[]): Promise<string> {
   const res = await fetch(`${OPENAI}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({ model: "gpt-4o", messages, max_tokens: 2000, temperature: 0.5 }),
   });
-  if (!res.ok) throw new Error(`GPT error ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`GPT ${res.status}: ${await res.text()}`);
   const data = await res.json();
   return data.choices?.[0]?.message?.content || "";
 }
 
-// ─── Responses API ile görsel üret (ChatGPT yöntemi) ───
-async function responsesAPI(apiKey: string, imageDataUrl: string, prompt: string): Promise<string | null> {
-  console.log("    [Responses API] Sending request...");
-
-  const requestBody = {
-    model: "gpt-4o",
-    input: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "input_image",
-            image_url: imageDataUrl,
-            detail: "high",
-          },
-          {
-            type: "input_text",
-            text: prompt,
-          },
-        ],
-      },
-    ],
-    tools: [
-      {
-        type: "image_generation",
-        quality: "high",
-        size: "1024x1024",
-      },
-    ],
-  };
-
-  const res = await fetch(`${OPENAI}/responses`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify(requestBody),
-  });
-
-  console.log(`    [Responses API] Status: ${res.status}`);
-
-  if (!res.ok) {
-    const errText = await res.text();
-    console.error(`    [Responses API] ERROR: ${errText.substring(0, 500)}`);
-    return null;
+// ─── Yüz pozisyonunu tespit et ───
+async function detectFaceRegion(apiKey: string, imageDataUrl: string): Promise<{ topPercent: number; bottomPercent: number; leftPercent: number; rightPercent: number }> {
+  try {
+    const raw = await gptText(apiKey, [{
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: `Look at this photo and find the person's HEAD (including hair, forehead to chin). 
+Give me the bounding box as percentages of the image dimensions.
+Respond ONLY with JSON, no markdown:
+{"topPercent": number, "bottomPercent": number, "leftPercent": number, "rightPercent": number}
+Where 0=top/left edge, 100=bottom/right edge.
+Include some margin around the head (add ~5% padding on each side).`,
+        },
+        { type: "image_url", image_url: { url: imageDataUrl } },
+      ],
+    }]);
+    const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
+    console.log("Face region:", JSON.stringify(parsed));
+    return parsed;
+  } catch (err) {
+    console.error("Face detection failed, using default:", err);
+    // Default: face is roughly in the top 40% of image
+    return { topPercent: 0, bottomPercent: 40, leftPercent: 15, rightPercent: 85 };
   }
-
-  const data = await res.json();
-
-  // Log the full structure
-  const outputTypes = (data.output || []).map((b: any) => b.type);
-  console.log(`    [Responses API] Output types: ${JSON.stringify(outputTypes)}`);
-
-  // Search for image in every possible location
-  for (const block of data.output || []) {
-    // Direct image_generation_call
-    if (block.type === "image_generation_call") {
-      if (block.result) {
-        console.log(`    [Responses API] Found image in image_generation_call (${block.result.length} chars)`);
-        return `data:image/png;base64,${block.result}`;
-      }
-    }
-
-    // Inside message content
-    if (block.type === "message" && Array.isArray(block.content)) {
-      for (const c of block.content) {
-        console.log(`    [Responses API] Message content type: ${c.type}`);
-        if (c.type === "output_image" && c.image_url) {
-          console.log("    [Responses API] Found output_image");
-          return c.image_url;
-        }
-        if (c.type === "image" && c.image_url) {
-          console.log("    [Responses API] Found image");
-          return c.image_url;
-        }
-        if (c.type === "refusal") {
-          console.log(`    [Responses API] REFUSAL: ${c.refusal}`);
-        }
-      }
-    }
-  }
-
-  // Last resort: dump first 1000 chars of response
-  console.log(`    [Responses API] No image found. Full response: ${JSON.stringify(data).substring(0, 1000)}`);
-  return null;
 }
 
-// ─── images.edit yedek yöntem ───
-async function imagesEdit(apiKey: string, imageBase64: string, prompt: string): Promise<string | null> {
-  console.log("    [images.edit] Sending request...");
+// ─── Mask oluştur: yüz=opaque(korunan), gövde=transparent(düzenlenecek) ───
+async function createMask(
+  width: number,
+  height: number,
+  faceRegion: { topPercent: number; bottomPercent: number; leftPercent: number; rightPercent: number }
+): Promise<Buffer> {
+  // Yüz bölgesi koordinatları (piksel)
+  const faceTop = Math.max(0, Math.floor((faceRegion.topPercent / 100) * height));
+  const faceBottom = Math.min(height, Math.floor((faceRegion.bottomPercent / 100) * height));
+  const faceLeft = Math.max(0, Math.floor((faceRegion.leftPercent / 100) * width));
+  const faceRight = Math.min(width, Math.floor((faceRegion.rightPercent / 100) * width));
 
-  const base64Clean = imageBase64.replace(/^data:image\/\w+;base64,/, "");
+  console.log(`Mask: ${width}x${height}, face protected: y=${faceTop}-${faceBottom}, x=${faceLeft}-${faceRight}`);
+
+  // RGBA buffer oluştur
+  const channels = 4;
+  const buffer = Buffer.alloc(width * height * channels);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * channels;
+
+      const inFaceRegion =
+        y >= faceTop && y <= faceBottom &&
+        x >= faceLeft && x <= faceRight;
+
+      if (inFaceRegion) {
+        // YÜZ BÖLGESİ → opaque (alpha=255) → KORUNAN, düzenlenmez
+        buffer[idx] = 255;     // R
+        buffer[idx + 1] = 255; // G
+        buffer[idx + 2] = 255; // B
+        buffer[idx + 3] = 255; // A = opaque = KEEP
+      } else {
+        // GÖVDe/KIYAFET → transparent (alpha=0) → DÜZENLENECEK
+        buffer[idx] = 0;       // R
+        buffer[idx + 1] = 0;   // G
+        buffer[idx + 2] = 0;   // B
+        buffer[idx + 3] = 0;   // A = transparent = EDIT
+      }
+    }
+  }
+
+  // PNG olarak encode et
+  const maskPng = await sharp(buffer, { raw: { width, height, channels } })
+    .png()
+    .toBuffer();
+
+  console.log(`Mask created: ${maskPng.length} bytes`);
+  return maskPng;
+}
+
+// ─── images.edit + mask ile inpainting ───
+async function inpaintOutfit(
+  apiKey: string,
+  imagePngBuffer: Buffer,
+  maskPngBuffer: Buffer,
+  prompt: string
+): Promise<string | null> {
+  const formData = new FormData();
+
+  const imageBlob = new Blob([new Uint8Array(imagePngBuffer)], { type: "image/png" });
+  const maskBlob = new Blob([new Uint8Array(maskPngBuffer)], { type: "image/png" });
+
+  formData.append("image", imageBlob, "photo.png");
+  formData.append("mask", maskBlob, "mask.png");
+  formData.append("model", "gpt-image-1");
+  formData.append("prompt", prompt);
+  formData.append("n", "1");
+  formData.append("size", "1024x1024");
 
   const res = await fetch(`${OPENAI}/images/edits`, {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}` },
-    body: await buildFormData(base64Clean, prompt),
+    body: formData,
   });
 
-  console.log(`    [images.edit] Status: ${res.status}`);
-
   if (!res.ok) {
-    console.error(`    [images.edit] ERROR: ${(await res.text()).substring(0, 500)}`);
+    const errText = await res.text();
+    console.error(`images.edit error ${res.status}: ${errText.substring(0, 500)}`);
     return null;
   }
 
   const data = await res.json();
   if (data.data?.[0]?.b64_json) {
-    console.log("    [images.edit] Got base64 image");
     return `data:image/png;base64,${data.data[0].b64_json}`;
   }
   if (data.data?.[0]?.url) {
-    console.log("    [images.edit] Got URL image");
     return data.data[0].url;
   }
-
-  console.log("    [images.edit] No image in response");
   return null;
-}
-
-async function buildFormData(base64: string, prompt: string): Promise<FormData> {
-  const buffer = Buffer.from(base64, "base64");
-  const blob = new Blob([new Uint8Array(buffer)], { type: "image/png" });
-  const formData = new FormData();
-  formData.append("image", blob, "photo.png");
-  formData.append("model", "gpt-image-1");
-  formData.append("prompt", prompt);
-  formData.append("n", "1");
-  formData.append("size", "1024x1024");
-  return formData;
-}
-
-function buildPrompt(outfit: any, analysis: any): string {
-  return `CRITICAL: FACE & IDENTITY PRESERVATION
-
-You are editing a real photograph. Keep the EXACT same person — their face, identity, skin, hair, body, pose, background, lighting must remain pixel-perfect identical. 
-
-Person details (DO NOT CHANGE): ${analysis.gender}, ~${analysis.age}, ${analysis.skinTone} skin, ${analysis.undertone} undertone, ${analysis.hairColor} hair, ${analysis.faceShape} face, ${analysis.bodyType} body.
-
-ONLY CHANGE CLOTHING:
-- Top: ${outfit.top}
-- Bottom: ${outfit.bottom}  
-- Shoes: ${outfit.shoes}
-
-ADD ACCESSORIES:
-${outfit.accessories?.map((a: string) => "- " + a).join("\n") || "- None"}
-
-The result must look like the same photo with different clothes. Face identity = #1 priority. If the face changes even 1%, the output is a failure.`;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -182,7 +160,6 @@ export async function POST(request: NextRequest) {
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      console.log("No API key, returning mock data");
       return NextResponse.json({ success: true, mode: "mock", analysis: getMockAnalysis(), outfits: getMockOutfits() });
     }
 
@@ -190,28 +167,46 @@ export async function POST(request: NextRequest) {
       ? imageBase64
       : `data:image/jpeg;base64,${imageBase64}`;
 
-    console.log(`Image size: ~${Math.round(imageBase64.length / 1024)}KB`);
+    // ─── Görseli 1024x1024 PNG'ye dönüştür ───
+    console.log("Preparing image...");
+    const base64Clean = imageBase64.replace(/^data:image\/\w+;base64,/, "");
+    const inputBuffer = Buffer.from(base64Clean, "base64");
 
-    // ═══ STEP 1: Analyze ═══
-    console.log("=== STEP 1: Analyzing ===");
+    const resizedImage = await sharp(inputBuffer)
+      .resize(1024, 1024, { fit: "cover", position: "center" })
+      .png()
+      .toBuffer();
+
+    console.log(`Image resized to 1024x1024 (${resizedImage.length} bytes)`);
+
+    // ═══ STEP 1: Yüz pozisyonunu tespit et ═══
+    console.log("=== STEP 1: Detecting face ===");
+    const faceRegion = await detectFaceRegion(apiKey, imageDataUrl);
+
+    // ═══ STEP 2: Mask oluştur ═══
+    console.log("=== STEP 2: Creating mask ===");
+    const maskBuffer = await createMask(1024, 1024, faceRegion);
+
+    // ═══ STEP 3: Kişiyi analiz et ═══
+    console.log("=== STEP 3: Analyzing person ===");
     let analysis;
     try {
       const raw = await gptText(apiKey, [{
         role: "user",
         content: [
-          { type: "text", text: 'Analyze this person. ONLY JSON:\n{"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"25-30","confidence":95}' },
+          { type: "text", text: 'Analyze for fashion. ONLY JSON:\n{"skinTone":"Light/Medium/Olive/Dark","undertone":"Warm/Cool/Neutral","faceShape":"Oval/Round/Square/Heart","bodyType":"Ectomorph/Mesomorph/Endomorph/Athletic","hairColor":"...","gender":"Male/Female","age":"25-30","confidence":95}' },
           { type: "image_url", image_url: { url: imageDataUrl } },
         ],
       }]);
       analysis = JSON.parse(raw.replace(/```json|```/g, "").trim());
       console.log("Analysis:", JSON.stringify(analysis));
-    } catch (err: any) {
-      console.error("Analysis failed:", err?.message);
+    } catch (err) {
+      console.error("Analysis failed:", err);
       analysis = getMockAnalysis();
     }
 
-    // ═══ STEP 2: Outfits ═══
-    console.log("=== STEP 2: Outfits ===");
+    // ═══ STEP 4: Kıyafet önerileri ═══
+    console.log("=== STEP 4: Outfit suggestions ===");
     const styleLabels: Record<string, string> = {
       "old-money": "Old Money / Quiet Luxury", streetwear: "Streetwear / Urban",
       minimal: "Minimalist", "smart-casual": "Smart Casual",
@@ -222,46 +217,41 @@ export async function POST(request: NextRequest) {
     try {
       const raw = await gptText(apiKey, [{
         role: "user",
-        content: `Stylist. PERSON: ${analysis.gender}, ~${analysis.age}, ${analysis.skinTone} (${analysis.undertone}), ${analysis.hairColor} hair, ${analysis.bodyType}.\nSTYLE: ${styleLabels[style] || style}\n${productUrl ? "INCLUDE: " + productUrl : ""}\n\n3 outfits. ONLY JSON:\n[{"name":"Safe Stylish","description":"...","top":"...","bottom":"...","shoes":"...","accessories":["..."],"colors":["#hex","#hex","#hex"],"occasion":"..."},{"name":"Trendy Bold",...},{"name":"Premium Luxury",...}]`,
+        content: `World-class stylist. PERSON: ${analysis.gender}, ~${analysis.age}, ${analysis.skinTone} skin (${analysis.undertone}), ${analysis.hairColor} hair, ${analysis.bodyType}.\nSTYLE: ${styleLabels[style] || style}\n${productUrl ? "INCLUDE: " + productUrl : ""}\n\n3 outfits. ONLY JSON:\n[{"name":"Safe Stylish","description":"...","top":"garment fabric color #hex","bottom":"garment fabric color #hex","shoes":"shoe material color","accessories":["item1","item2"],"colors":["#hex1","#hex2","#hex3"],"occasion":"..."},{"name":"Trendy Bold",...},{"name":"Premium Luxury",...}]`,
       }]);
       outfits = JSON.parse(raw.replace(/```json|```/g, "").trim());
       console.log("Outfits:", outfits.map((o: any) => o.name).join(", "));
-    } catch (err: any) {
-      console.error("Outfits failed:", err?.message);
+    } catch (err) {
+      console.error("Outfits failed:", err);
       outfits = getMockOutfits();
     }
 
-    // ═══ STEP 3: Edit photos ═══
-    console.log("=== STEP 3: Editing photos ===");
+    // ═══ STEP 5: Mask ile inpainting — sadece kıyafet değişir ═══
+    console.log("=== STEP 5: Inpainting with mask ===");
 
-    // Önce Responses API'yi dene
-    console.log("  Testing Responses API with outfit 1...");
-    const testPrompt = buildPrompt(outfits[0], analysis);
-    const testResult = await responsesAPI(apiKey, imageDataUrl, testPrompt);
-    const useResponses = testResult !== null;
-    console.log(`  Responses API: ${useResponses ? "SUCCESS" : "FAILED"}`);
+    const editResults: (string | null)[] = [];
 
-    let editResults: (string | null)[];
+    for (let i = 0; i < outfits.length; i++) {
+      const outfit = outfits[i];
+      console.log(`  Outfit ${i + 1}/3: ${outfit.name}...`);
 
-    if (useResponses) {
-      // Responses API çalışıyor
-      console.log("  Using Responses API for all outfits...");
-      editResults = [testResult];
-      for (let i = 1; i < outfits.length; i++) {
-        console.log(`  Outfit ${i + 1}/3...`);
-        const r = await responsesAPI(apiKey, imageDataUrl, buildPrompt(outfits[i], analysis));
-        editResults.push(r);
-        console.log(`  Outfit ${i + 1}/3: ${r ? "OK" : "FAIL"}`);
-      }
-    } else {
-      // images.edit fallback
-      console.log("  Using images.edit fallback for all outfits...");
-      editResults = [];
-      for (let i = 0; i < outfits.length; i++) {
-        console.log(`  Outfit ${i + 1}/3...`);
-        const r = await imagesEdit(apiKey, imageBase64, buildPrompt(outfits[i], analysis));
-        editResults.push(r);
-        console.log(`  Outfit ${i + 1}/3: ${r ? "OK" : "FAIL"}`);
+      const prompt = `Edit ONLY the clothing area of this photo (the masked/transparent region). The face and head area is protected and must not be touched at all.
+
+Replace the visible clothing with:
+- Top/shirt: ${outfit.top}
+- Pants/bottom: ${outfit.bottom}
+- Shoes: ${outfit.shoes}
+- Add accessories: ${outfit.accessories?.join(", ") || "none"}
+
+Keep the person's exact body shape and pose. The new clothes must fit naturally with realistic fabric, folds, and shadows matching the existing lighting. The result must look like a real photograph.`;
+
+      try {
+        const result = await inpaintOutfit(apiKey, resizedImage, maskBuffer, prompt);
+        editResults.push(result);
+        console.log(`  ${result ? "✅" : "❌"} Outfit ${i + 1}/3`);
+      } catch (err: any) {
+        console.error(`  ❌ Outfit ${i + 1}/3 error:`, err?.message);
+        editResults.push(null);
       }
     }
 
@@ -277,12 +267,11 @@ export async function POST(request: NextRequest) {
       generatedImage: editResults[i] || null,
     }));
 
-    const mode = useResponses ? "responses-api" : "images-edit";
-    console.log(`=== DONE === Mode: ${mode}, Images: ${editResults.filter(Boolean).length}/3`);
+    console.log(`=== DONE === Images: ${editResults.filter(Boolean).length}/3`);
 
     return NextResponse.json({
       success: true,
-      mode,
+      mode: "mask-inpainting",
       analysis: {
         skinTone: analysis.skinTone || "Medium",
         undertone: analysis.undertone || "Neutral",
@@ -303,6 +292,7 @@ export async function POST(request: NextRequest) {
 function getMockAnalysis() {
   return { skinTone: "Medium", undertone: "Warm", faceShape: "Oval", bodyType: "Mesomorph", hairColor: "Brown", gender: "Male", confidence: "92" };
 }
+
 function getMockOutfits() {
   return [
     { name: "Safe Stylish", description: "Classic", top: "Navy sweater (#1B2A4A)", bottom: "Beige chinos (#D2B48C)", shoes: "Brown loafers", accessories: ["Gold watch"], colors: ["#1B2A4A", "#D2B48C", "#8B6914"], occasion: "Casual", generatedImage: null },
