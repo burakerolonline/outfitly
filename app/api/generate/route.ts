@@ -65,8 +65,7 @@ async function inpaintOutfit(
   outfit: { top: string; bottom: string; shoes: string; accessories: string[] }
 ): Promise<{ image: string | null; debug: string }> {
   try {
-    // Kısa ve net prompt — uzun negatif listeler modeli karıştırıyor
-    const prompt = `Dress this exact person in: ${outfit.top}, ${outfit.bottom}, ${outfit.shoes}${outfit.accessories?.length ? ", " + outfit.accessories.join(", ") : ""}. Preserve the person's face, identity, pose, and background exactly.`;
+    const prompt = `Do NOT alter the face, skin, hair, or any facial features in any way. The face must remain pixel-perfect identical to the original. Only modify the clothing/outfit area. New outfit: ${outfit.top}, ${outfit.bottom}, ${outfit.shoes}${outfit.accessories?.length ? ", " + outfit.accessories.join(", ") : ""}. Keep original: face, hair, skin tone, facial expression, eye color, pose, background, lighting on face.`;
 
     const formData = new FormData();
     formData.append("image", new Blob([new Uint8Array(pngBuffer)], { type: "image/png" }), "person.png");
