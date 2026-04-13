@@ -34,37 +34,30 @@ async function gptText(apiKey: string, prompt: string): Promise<string> {
   return (await res.json()).choices?.[0]?.message?.content || "";
 }
 
-// ─── MASK: üst %45 korunur (yüz + boyun + omuz üstü), alt %55 edit edilir (kıyafet) ──
-// Kural: transparent (alpha=0) = AI tarafından düzenlenir, opaque (alpha=255) = korunur
-// %45 → yüz + saç + boyun + omuz başlangıcını tam kapsar
-async function createMask(width: number, height: number): Promise<Buffer> {
-  const preserveHeight = Math.floor(height * 0.45);
-  const base = await sharp({
-    create: { width, height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }, // transparent = AI edits
-  }).png().toBuffer();
-  const faceBlock = await sharp({
-    create: { width, height: preserveHeight, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 255 } }, // opaque = preserved
-  }).png().toBuffer();
-  return sharp(base).composite([{ input: faceBlock, top: 0, left: 0 }]).png().toBuffer();
-}
-
-// ─── FACE RESTORE: KALDIRILDI ─────────────────────────────────────────────────
-// Sebebi: hard rectangular paste (top %40 kopyala yapıştır) yüzde görünür seam
-// ve renk uyumsuzluğu yaratıyordu. Mask (%45 preserve) yeterli korumayı sağlar.
-
-// ─── INPAINTING + FACE RESTORE ────────────────────────────────────────────────
+// ─── OUTFIT GENERATION: Mask yok — sadece güçlü prompt ──────────────────────
+// ChatGPT'nin yaptığı ile aynı: image + prompt, mask gönderme.
+// Mask modeli karıştırıyor: boş alanı kendi hayal ettiği vücutla dolduruyor.
+// gpt-image-1 bu tür "keep person, change clothes" promptlarını maskesiz çok daha iyi anlıyor.
 async function inpaintOutfit(
   apiKey: string,
   pngBuffer: Buffer,
-  maskBuffer: Buffer,
   outfit: { top: string; bottom: string; shoes: string; accessories: string[] }
 ): Promise<{ image: string | null; debug: string }> {
   try {
-    const prompt = `Do NOT alter the face, skin, hair, or any facial features in any way. The face must remain pixel-perfect identical to the original. Only modify the clothing/outfit area. New outfit: ${outfit.top}, ${outfit.bottom}, ${outfit.shoes}${outfit.accessories?.length ? ", " + outfit.accessories.join(", ") : ""}. Keep original: face, hair, skin tone, facial expression, eye color, pose, background, lighting on face.`;
+    const outfitDesc = [outfit.top, outfit.bottom, outfit.shoes, ...(outfit.accessories || [])].filter(Boolean).join(", ");
+
+    const prompt =
+      `This is a real photo of a specific person. ` +
+      `Keep this exact person: same face, same identity, same skin tone, same hair color and style, ` +
+      `same body proportions, same pose, same background, same lighting, same camera angle. ` +
+      `The person's appearance must be identical to the original photo. ` +
+      `Only change what they are wearing. ` +
+      `Dress them in the following outfit: ${outfitDesc}. ` +
+      `Do not change the face, do not change the background, do not change the pose. ` +
+      `Result should look like the same photo but with different clothes.`;
 
     const formData = new FormData();
     formData.append("image", new Blob([new Uint8Array(pngBuffer)], { type: "image/png" }), "person.png");
-    formData.append("mask",  new Blob([new Uint8Array(maskBuffer)], { type: "image/png" }), "mask.png");
     formData.append("prompt", prompt);
     formData.append("model", "gpt-image-1");
     formData.append("size", "1024x1024");
@@ -95,9 +88,7 @@ async function inpaintOutfit(
       return { image: null, debug: `Beklenmedik yanıt: ${JSON.stringify(data).substring(0, 200)}` };
     }
 
-    // Mask doğru çalıştığında (%45 preserve) face restore gereksiz ve zararlı.
-    // Direkt üretilen görseli döndür.
-    return { image: generatedImage, debug: "inpainting ✓" };
+    return { image: generatedImage, debug: "image-edit ✓" };
   } catch (e: any) {
     return { image: null, debug: `Exception: ${e?.message?.substring(0, 200)}` };
   }
@@ -126,8 +117,7 @@ export async function POST(request: NextRequest) {
       await sharp(raw).resize(800, 800, { fit: "cover", position: "attention" }).jpeg({ quality: 80 }).toBuffer()
     ).toString("base64")}`;
 
-    // Mask bir kez üretilir
-    const maskBuffer = await createMask(1024, 1024);
+    // Mask kaldırıldı — gpt-image-1 prompt ile yönlendiriliyor
 
     // ── STEP 1: Analiz ────────────────────────────────────
     let analysis: any;
@@ -156,7 +146,7 @@ export async function POST(request: NextRequest) {
     const results = await Promise.all(
       outfits.map((o: any, i: number) => {
         console.log(`[${i + 1}/3] "${o.name}" başlatıldı`);
-        return inpaintOutfit(apiKey, pngBuffer, maskBuffer, {
+        return inpaintOutfit(apiKey, pngBuffer, {
           top: o.top, bottom: o.bottom, shoes: o.shoes, accessories: o.accessories || [],
         });
       })
@@ -165,7 +155,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      mode: "inpainting",
+      mode: "image-edit",
       analysis: {
         skinTone: analysis.skinTone || "Medium", undertone: analysis.undertone || "Neutral",
         faceShape: analysis.faceShape || "Oval", bodyType: analysis.bodyType || "Mesomorph",
